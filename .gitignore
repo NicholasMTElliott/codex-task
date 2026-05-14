@@ -1,0 +1,30 @@
+# Per-session interim work dir written by the tool when run from this dir
+.codex-task-tmp/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.eslintcache
+*.tsbuildinfo
+
+# Build / coverage / dist
+dist/
+build/
+coverage/
+.nyc_output/
+
+# Env
+.env
+.env.*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
