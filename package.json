@@ -5,10 +5,32 @@
   "type": "module",
   "license": "MIT",
   "author": "Nicholas Elliott",
+  "homepage": "https://github.com/NicholasMTElliott/codex-task#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NicholasMTElliott/codex-task.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NicholasMTElliott/codex-task/issues"
+  },
+  "keywords": [
+    "codex",
+    "cli",
+    "coding-agent",
+    "claude-code",
+    "opencode",
+    "cline",
+    "cursor",
+    "skills"
+  ],
   "engines": {
     "node": ">=18"
   },
+  "bin": {
+    "codex-task": "./codex-task.mjs"
+  },
   "scripts": {
+    "check": "node --check codex-task.mjs && node --check install.mjs",
     "test": "node --test"
   },
   "files": [

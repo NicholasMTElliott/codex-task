@@ -44,6 +44,9 @@ When you're running on a Claude (or other paid) subscription and want to delegat
 | `install.mjs` | Cross-platform installer. Copies the tool to `~/.codex-task/` and registers the skill with each supported harness (Claude Code, opencode, Cline, Cursor). |
 | `SKILL.md` | Skill template (Anthropic frontmatter — `name` + `description` + `allowed-tools`). The installer fills in the resolved install path and drops the same rendered file into every target's user-global skills dir. |
 | `memory-bank/` | LLM-optimized project context (projectBrief, productContext, systemPatterns, techContext). |
+| `tests/` | Node test smoke coverage for the CLI help and installer target listing. |
+| `package.json` | Open-source package metadata, scripts, engine, and optional `codex-task` bin entry. |
+| `LICENSE` | MIT license. |
 | `README.md` | This file. |
 
 ## Prerequisites
@@ -66,7 +69,7 @@ When you're running on a Claude (or other paid) subscription and want to delegat
 ## Install
 
 ```bash
-git clone https://github.com/NicholasMTElliott/codex-task.git    # placeholder URL
+git clone https://github.com/NicholasMTElliott/codex-task.git
 cd codex-task
 node install.mjs
 ```
@@ -256,10 +259,10 @@ The installer is idempotent: re-running overwrites the installed copy in `~/.cod
 - **Why we delete `OPENAI_API_KEY`**: codex routes to API billing if it sees that variable, silently. We force subscription routing by stripping it from the spawned env.
 - **Why we don't override `CODEX_HOME`**: codex stores its ChatGPT auth there. Override → fresh-install state → no auth → 401.
 - **Why prompt is piped via stdin**: `codex exec` accepts the prompt as a positional arg, but on Windows with `shell:true` (required to spawn `codex.cmd` post-CVE-2024-27980) Node concatenates args without escaping, so a multi-word prompt gets split. Stdin sidesteps the issue.
-- **Why hands-off operation**: the wrapper always passes `--ask-for-approval never` (and historically `--full-auto`, which is the same combination plus `workspace-write`). Trade-off: codex can't pause to ask questions, so the parent agent must specify the task up-front.
+- **Why hands-off operation**: `codex exec` defaults approval to `never`, and the wrapper does not expose interactive approval flags. Trade-off: codex can't pause to ask questions, so the parent agent must specify the task up-front.
 - **Why `read-only` is the default**: most delegated agent work is investigation — "find every X", "summarize Y", "audit Z". Defaulting to a sandbox that can't modify the user's project makes "I tried codex-task and it broke my repo" impossible by construction. Refactors/edits opt in via `--permissions workspace-write`.
 - **Why the scratch dir lives in OS temp, not in the workdir**: keeps the user's project clean of wrapper artifacts (no `.codex-task-tmp/` to add to `.gitignore`). Codex itself writes the agent's final message into the scratch dir via `--output-last-message`, which is a wrapper-process write and is unaffected by `--sandbox` — so `read-only` works end-to-end without needing any write-access concessions in the model sandbox.
-- **Why `--cd` to the user's workdir, not a sandbox**: unlike `codex-image-gen` (which sandboxes codex in a fresh tmp dir for image generation), `codex-task` deliberately points codex at the user's project. The whole point is to perform work on the user's files. The blast radius is bounded by codex's `--sandbox` policy, which is in turn confined to `--cd` (plus the scratch dir).
+- **Why `--cd` to the user's workdir, not a sandbox**: unlike `codex-image-gen` (which sandboxes codex in a fresh tmp dir for image generation), `codex-task` deliberately points codex at the user's project. The whole point is to perform work on the user's files. The blast radius is bounded by codex's `--sandbox` policy, which is in turn confined to `--cd`; the scratch dir is written by the codex CLI process only through `--output-last-message`.
 - **Why `--ephemeral` by default**: this is a one-shot delegated task, not part of a persisted interactive session. We don't want every codex-task invocation cluttering codex's session history.
 - **Why `--output-last-message` instead of parsing stdout**: codex's `exec` stdout is verbose — reasoning traces, tool-call chatter, partial outputs — and meant for humans. `--output-last-message` tells codex's CLI process to write *just* the agent's final message text to a file after the run, no interleaving. We tell the model in the prompt that its final message must be a single JSON object, and parse the file we get back. As a bonus, this leaves stdout free for live progress streaming.
 - **Why coerce unknown action verbs to `referenced`**: codex occasionally returns synonyms like `"modified"` or `"updated"`. Rejecting the whole run for a synonym would be hostile to callers; the wrapper rewrites and warns instead. The schema's `files` map is always one of the four canonical verbs.
@@ -276,4 +279,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Contributing
 
-Issues and PRs welcome. The tool is small (single ~300-line `.mjs` file) and intentionally zero-dep; please preserve both properties when proposing changes.
+Issues and PRs welcome. The runtime is a single `.mjs` file and intentionally zero-dep; please preserve both properties when proposing changes.

@@ -387,8 +387,8 @@ function install(parsed) {
   log(`  node ${scriptPath} --help\n`);
   log('First real run (uses ChatGPT subscription quota):');
   log(`  node ${scriptPath} --prompt "Summarize the README.md in this project"\n`);
-  log(`Note: each project that calls the tool will create a .codex-task-tmp/`);
-  log(`directory in its working directory. Add it to that project's .gitignore.`);
+  log(`Note: per-run scratch files live under your OS temp directory, not in`);
+  log(`the project being inspected or edited.`);
 }
 
 /**

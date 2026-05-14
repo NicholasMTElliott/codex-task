@@ -29,4 +29,4 @@ Portable Node CLI tool that lets Claude Code, opencode, Cline, Cursor, or any ot
 - Final stdout output MUST be a single valid JSON object — never partial or interleaved. Codex's own log output streams to stderr by default so it doesn't corrupt stdout for piping callers.
 
 ## Distribution
-GitHub: TBD (parallel to `codex-image-gen` — same author, same MIT license).
+GitHub: `https://github.com/NicholasMTElliott/codex-task`. Default branch policy: `mainline`. MIT licensed. Public package metadata lives in `package.json` (`repository`, `bugs`, `homepage`, `keywords`, `bin`).

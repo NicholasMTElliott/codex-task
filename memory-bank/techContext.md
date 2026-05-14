@@ -18,7 +18,7 @@
   - `codex` installs as `codex.cmd` via npm. Spawning `.cmd` post-CVE-2024-27980 requires `shell:true` (else EINVAL).
   - `shell:true` triggers DEP0190 — suppressed via `process.removeAllListeners('warning')` and a filtered handler. Args are static + a path with no shell metachars, so this is safe here.
   - Under `shell:true`, Node concatenates argv without escaping → multi-word prompts split. Mitigated by piping the prompt via stdin instead of passing it as an argv positional.
-- **Output sandbox.** `codex exec --cd <workdir>` is the primary write boundary, modulated by `--sandbox <mode>` (set from our `--permissions`). Under `read-only` (the default) codex can't write to the workdir at all; we use codex's `--add-dir <sessionDir>` to grant write access to *just* the wrapper's scratch dir, which lives outside the workdir under OS tmp. Under `workspace-write`, the workdir is also writable. `danger-full-access` removes all filesystem boundaries.
+- **Output sandbox.** `codex exec --cd <workdir>` is the primary model write boundary, modulated by `--sandbox <mode>` (set from our `--permissions`). Under `read-only` (the default) codex can't write to the workdir at all. The wrapper creates `<os.tmpdir()>/codex-task/<sessionId>/last-message.txt` via codex's `--output-last-message`, which is a codex CLI-process write, not a model write. Under `workspace-write`, the workdir is writable. `danger-full-access` removes all filesystem boundaries.
 - **Stdout contract.** Our stdout is reserved for the final JSON result. Codex's own progress chatter flows to stderr (live, by default) so pipes consuming our stdout get exactly one valid JSON document. `--quiet` discards the stderr stream entirely except for a 4KB tail captured for failure reporting.
 
 ## Codex behaviors (empirical)
@@ -38,7 +38,7 @@
 
 ## Setup
 ```bash
-git clone https://github.com/NicholasMTElliott/codex-task.git    # placeholder URL
+git clone https://github.com/NicholasMTElliott/codex-task.git
 cd codex-task
 node install.mjs                                          # install (auto-detect targets)
 node install.mjs --target=claude,opencode,cline,cursor    # explicit targets
@@ -80,5 +80,7 @@ Installer paths (per-target; the binary is shared):
 - `README.md` — user-facing docs.
 - `AGENTS.md` / `CLAUDE.md` — agent-facing instructions; CLAUDE.md is a one-line `@AGENTS.md` re-export.
 - `.gitignore` — standard Node / OS-noise ignores. The wrapper does not write into the project directory, so no project-specific entries are needed.
+- `.gitattributes` — normalizes text files to LF for GitHub/cross-platform diffs.
 - `LICENSE` — MIT.
-- `package.json` — stub with `"type": "module"`. Not required for execution (the `.mjs` extension is enough) but useful for editor/tooling integration.
+- `package.json` — npm-compatible metadata (`type: module`, `bin`, `repository`, `bugs`, `homepage`, `keywords`, `engines`, scripts). No dependencies.
+- `tests/cli-smoke.test.mjs` — Node test smoke coverage for CLI help and installer target listing.
