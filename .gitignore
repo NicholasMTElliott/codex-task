@@ -1,6 +1,3 @@
-# Per-session interim work dir written by the tool when run from this dir
-.codex-task-tmp/
-
 # Node
 node_modules/
 npm-debug.log*

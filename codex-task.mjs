@@ -17,7 +17,9 @@
  *     "details": "...",
  *     "files": { "<path>": "<created|deleted|edited|referenced>", ... },
  *     "workdir":   "<absolute path codex was --cd'd to>",
- *     "sessionDir":"<tmp dir under workdir, removed on success>",
+ *     "sessionDir":"<absolute OS-tmp session dir, removed on success>",
+ *     "model":     "<model used>",
+ *     "permissions": "<sandbox mode used>",
  *     "warnings": [],
  *     "durationMs": 12345
  *   }
@@ -37,6 +39,7 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
 // Silence DEP0190 (spawn shell:true with args). shell:true is required on
@@ -52,6 +55,24 @@ process.on('warning', (w) => {
 // to "referenced" with a warning; we never reject the run for a stray verb.
 const ALLOWED_ACTIONS = new Set(['created', 'deleted', 'edited', 'referenced']);
 
+// Default model. The set of supported models is plan-dependent and not
+// enumerable from the CLI — codex validates server-side and returns 400 for
+// unsupported values. Common known names at time of writing: gpt-5.5,
+// gpt-5.5-codex, gpt-5, gpt-5-codex. Surface these in --help for hints.
+const DEFAULT_MODEL = 'gpt-5.5';
+const KNOWN_MODEL_HINTS = ['gpt-5.5', 'gpt-5.5-codex', 'gpt-5', 'gpt-5-codex'];
+
+// --permissions values map to (codex --sandbox) values. "full-auto" is kept
+// as a historical alias for workspace-write (the old --full-auto combo) so
+// users familiar with codex's deprecated flag have a recognizable name.
+const PERMISSIONS = {
+  'read-only':           { sandbox: 'read-only' },
+  'workspace-write':     { sandbox: 'workspace-write' },
+  'full-auto':           { sandbox: 'workspace-write' },  // alias
+  'danger-full-access':  { sandbox: 'danger-full-access' },
+};
+const DEFAULT_PERMISSIONS = 'read-only';
+
 // ---------- arg parsing ----------
 
 function parseArgs(argv) {
@@ -61,6 +82,9 @@ function parseArgs(argv) {
   let out = '';
   let debug = false;
   let quiet = false;
+  let model = DEFAULT_MODEL;
+  let permissions = DEFAULT_PERMISSIONS;
+  let profile = '';
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -71,6 +95,9 @@ function parseArgs(argv) {
     else if (arg === '--out') { out = next ?? ''; i++; }
     else if (arg === '--debug') { debug = true; }
     else if (arg === '--quiet') { quiet = true; }
+    else if (arg === '--model') { model = next ?? ''; i++; }
+    else if (arg === '--permissions') { permissions = (next ?? '').toLowerCase(); i++; }
+    else if (arg === '--profile') { profile = next ?? ''; i++; }
     else if (arg === '-h' || arg === '--help') { printUsage(process.stdout); process.exit(0); }
     else { usageErr(`unknown argument "${arg}"`); }
   }
@@ -79,7 +106,13 @@ function parseArgs(argv) {
   if (promptFile) prompt = readPromptFile(promptFile, '--prompt-file');
   if (!prompt) { printUsage(process.stderr); process.exit(2); }
 
-  return { prompt, cwd, out, debug, quiet };
+  if (!model) usageErr('--model requires a value');
+  if (!Object.prototype.hasOwnProperty.call(PERMISSIONS, permissions)) {
+    const allowed = Object.keys(PERMISSIONS).join(', ');
+    usageErr(`--permissions must be one of: ${allowed} (got "${permissions}")`);
+  }
+
+  return { prompt, cwd, out, debug, quiet, model, permissions, profile };
 }
 
 function usageErr(msg) {
@@ -104,69 +137,124 @@ function readPromptFile(path, flag) {
 }
 
 function printUsage(stream = process.stderr) {
+  const perms = Object.keys(PERMISSIONS).join('|');
   stream.write(
     `Usage:
   node codex-task.mjs (--prompt "<text>" | --prompt-file <path>)
                       [--cwd DIR] [--out FILE] [--debug] [--quiet]
+                      [--model MODEL] [--permissions ${perms}]
+                      [--profile NAME]
 
 Wrap a single 'codex exec' invocation, run an arbitrary agent task, and
 capture a structured JSON result describing what files were touched.
 
+Required:
   --prompt       Inline task description. Anything you'd tell codex to do.
   --prompt-file  Read the task description from a UTF-8 text file. Mutually
                  exclusive with --prompt. Trailing whitespace is trimmed;
                  internal newlines are preserved.
+
+Workspace:
   --cwd          Working directory codex operates inside (relative to caller
-                 cwd, or absolute). Default: caller cwd. codex's workspace-
-                 write sandbox is confined to this directory.
-  --out          Also write the result JSON to this file path (still printed
-                 to stdout). Useful for piping or persisting.
-  --debug        Keep the per-session tmp dir on success. Default cleans it
-                 up. Failures always preserve tmp regardless.
-  --quiet        Discard codex's live log output instead of streaming it to
-                 stderr. By default codex chatter prints to stderr so callers
-                 can follow progress; structured stdout (JSON) is unaffected.
+                 cwd, or absolute). Default: caller cwd. Codex's sandbox is
+                 bounded by this directory plus the wrapper's scratch dir.
+
+Codex pass-throughs:
+  --model        Model codex should use. Default: ${DEFAULT_MODEL}.
+                 Supported models are plan-dependent; codex validates
+                 server-side and returns an error for unsupported values.
+                 Common known values (your plan may vary):
+                   ${KNOWN_MODEL_HINTS.join(', ')}
+  --permissions  Sandbox policy for codex. Default: ${DEFAULT_PERMISSIONS}.
+                 Maps to codex's --sandbox flag (approval is always 'never'
+                 since 'codex exec' defaults approval to never):
+                   read-only          codex can read your workspace but
+                                      cannot modify or create any files
+                                      in it. Best for investigation,
+                                      audits, codebase questions.
+                   workspace-write    codex can read AND write inside the
+                                      working directory (--cwd). Files
+                                      outside the workdir remain read-only.
+                                      Use for refactors and edits.
+                   full-auto          alias for workspace-write (matches
+                                      the historical 'codex --full-auto'
+                                      shorthand).
+                   danger-full-access codex can read AND write anywhere
+                                      on the filesystem. Use only when you
+                                      explicitly need cross-tree writes
+                                      AND understand the blast radius.
+                 The structured result is captured via codex's
+                 --output-last-message flag (a codex-process write, not a
+                 model write), so it works under any --sandbox mode
+                 including 'read-only'.
+  --profile      Codex config profile name (--profile pass-through). If
+                 set, codex loads option defaults from this profile in
+                 ~/.codex/config.toml. Unset by default.
+
+Wrapper options:
+  --out          Also write the result JSON to this file path (still
+                 printed to stdout). Useful for piping or persisting.
+  --debug        Keep the per-session scratch dir on success. Default
+                 cleans it up. Failures always preserve it regardless.
+  --quiet        Discard codex's live log output instead of streaming it
+                 to stderr. By default codex chatter prints to stderr so
+                 callers can follow progress; structured stdout (JSON) is
+                 unaffected.
 
 Output: JSON on stdout. Shape:
 
   {
     "ok": true,
-    "summary":    "<one or two sentences>",
-    "details":    "<markdown>",
-    "files":      { "<path>": "<created|deleted|edited|referenced>", ... },
-    "workdir":    "<absolute --cwd>",
-    "sessionDir": "<tmp work dir, removed on success unless --debug>",
-    "warnings":   [],
-    "durationMs": 12345
+    "summary":     "<one or two sentences>",
+    "details":     "<markdown>",
+    "files":       { "<path>": "<created|deleted|edited|referenced>", ... },
+    "workdir":     "<absolute --cwd>",
+    "sessionDir":  null,
+    "model":       "<model used>",
+    "permissions": "<permissions mode used>",
+    "warnings":    [],
+    "durationMs":  12345
   }
 
-The per-session tmp dir is <workdir>/.codex-task-tmp/<sessionId>/ and is
-removed automatically on success unless --debug is set. Failures preserve it
-for debugging. Add ".codex-task-tmp/" to your project's .gitignore.
+The per-session scratch dir lives under your OS temp directory (NOT inside
+the workdir, so the user's project is never polluted with a wrapper-owned
+folder). It is removed automatically on success unless --debug is set;
+failures preserve it for debugging — the path appears in 'sessionDir'.
 
 Subscription billing: OPENAI_API_KEY is stripped from the spawned env so
-codex routes to ChatGPT subscription quota, not API tokens.
+codex routes to ChatGPT subscription quota, not API tokens. Each run is
+spawned with --ephemeral, so this wrapper never adds to codex's persisted
+session history — each task is a clean slate.
 `,
   );
 }
 
 // ---------- prompt synthesis ----------
 
-function buildPrompt(userPrompt, resultPath) {
-  // Posix-style path for the prompt — codex normalizes either, but forward
-  // slashes avoid backslash-escape ambiguity in its tool-call parsing.
-  const resultPathP = resultPath.replace(/\\/g, '/');
-  return [
+function buildPrompt(userPrompt, permissions) {
+  const readOnly = permissions === 'read-only';
+  const lines = [
     `You are being invoked through a wrapper that captures a structured result.`,
     ``,
     `TASK:`,
     userPrompt,
     ``,
-    `When you have completed the task, write a JSON file to this exact path:`,
-    `  ${resultPathP}`,
-    ``,
-    `The JSON file must follow this shape exactly — no other top-level keys, no`,
-    `surrounding prose, no markdown fences:`,
+  ];
+  if (readOnly) {
+    lines.push(
+      `IMPORTANT: This task runs under a READ-ONLY sandbox. You can read any`,
+      `file under the working directory, but you CANNOT modify, create, or`,
+      `delete files there. If the task asks you to modify files, instead`,
+      `describe in 'details' exactly what edits would be needed (with file`,
+      `paths and snippets). Use the 'files' map with action "referenced" for`,
+      `every file you read.`,
+      ``,
+    );
+  }
+  lines.push(
+    `When you have completed the task, your FINAL message must be a single`,
+    `JSON object with this exact shape — no prose before or after, no markdown`,
+    `fences, no commentary:`,
     ``,
     `{`,
     `  "summary": "<one or two sentence high-level description of what you did>",`,
@@ -190,36 +278,60 @@ function buildPrompt(userPrompt, resultPath) {
     `If the task is purely informational (no files touched), use an empty object`,
     `for "files".`,
     ``,
-    `Do not include the JSON in your normal output — only write it to the file`,
-    `path above. After the file is written and the task is done, stop.`,
-  ].join('\n');
+    `Your final message is the ONLY thing the wrapper sees — make sure it is`,
+    `just the JSON object above, nothing else.`,
+  );
+  return lines.join('\n');
 }
 
 // ---------- runtime ----------
 
-function runCodex({ prompt, env, cwd, quiet }) {
+function buildSpawnArgs({ workdir, lastMessagePath, model, permissions, profile }) {
+  // We always pass --ephemeral (this is a one-shot delegated task, not part
+  // of a persisted interactive session). --sandbox is set from --permissions.
+  //
+  // The structured result is captured via codex's --output-last-message flag,
+  // which writes the agent's FINAL message text to the given path. This is a
+  // codex-process write (NOT a model-driven write), so it bypasses --sandbox
+  // entirely — works fine even under read-only. Empirically verified against
+  // codex 0.128.0.
+  //
+  // Approval policy: codex exec defaults to 'never' in 0.128.0 and does NOT
+  // expose --ask-for-approval (it's a top-level codex flag, not an exec flag).
+  // Passing it on exec is a hard error, so we rely on the exec default.
+  const sandbox = PERMISSIONS[permissions].sandbox;
+  const args = [
+    'exec',
+    '--skip-git-repo-check',
+    '--ephemeral',
+    '--sandbox', sandbox,
+    '--cd', workdir,
+    '--model', model,
+    '--output-last-message', lastMessagePath,
+  ];
+  if (profile) args.push('--profile', profile);
+  return args;
+}
+
+function runCodex({ prompt, env, args, quiet }) {
   return new Promise((resolveP, rejectP) => {
     // On Windows codex is a .cmd shim — post-CVE-2024-27980 Node refuses to
     // spawn .cmd without shell:true (EINVAL). shell:true emits DEP0190 (we
-    // suppress it; args here are static flags + a path with no shell metachars).
+    // suppress it; args here are static flags + paths with no shell metachars).
     // Prompt itself is piped via stdin to dodge shell-arg-concat splitting.
     const isWin = process.platform === 'win32';
-    // --skip-git-repo-check: users will run this inside their own (often
-    // untrusted-to-codex) repos. We've already accepted --full-auto for
-    // hands-off execution; skipping the trust prompt is consistent with that.
-    const child = spawn('codex', ['exec', '--full-auto', '--skip-git-repo-check', '--cd', cwd], {
+    const child = spawn('codex', args, {
       env,
       stdio: ['pipe', quiet ? 'ignore' : 'inherit', quiet ? 'pipe' : 'inherit'],
       shell: isWin,
     });
     // When stderr is 'pipe' (quiet mode) we still want a tail for error
-    // reporting. When 'inherit', we let it flow through to the user's terminal
-    // and have no captured tail — codex's diagnostics are already visible.
+    // reporting. When 'inherit', codex's diagnostics flow to the user's
+    // terminal and we have no captured tail.
     let stderrTail = '';
     if (quiet && child.stderr) {
       child.stderr.on('data', (d) => {
         stderrTail += d.toString();
-        // Cap to avoid unbounded growth on a chatty failure.
         if (stderrTail.length > 4000) stderrTail = stderrTail.slice(-4000);
       });
     }
@@ -230,35 +342,78 @@ function runCodex({ prompt, env, cwd, quiet }) {
   });
 }
 
-function readResult(resultPath) {
-  // Returns { ok: true, value } | { ok: false, error }. Validates shape but
-  // doesn't normalize — that happens in the caller so warnings flow into the
-  // final result.warnings array.
-  if (!existsSync(resultPath)) {
-    return { ok: false, error: `result file not written by codex at ${resultPath}` };
+function readResult(lastMessagePath) {
+  // The "result" is whatever the model wrote as its final message; codex
+  // captured it via --output-last-message. We told the model the message
+  // must be a single JSON object, but models love to add fences or prose
+  // anyway. Try strict parse first, then fall back to extracting the first
+  // top-level {...} substring (simple brace-depth scan; handles strings).
+  if (!existsSync(lastMessagePath)) {
+    return { ok: false, error: `codex did not write a final message file at ${lastMessagePath}` };
   }
   let raw;
-  try { raw = readFileSync(resultPath, 'utf8'); }
-  catch (e) { return { ok: false, error: `failed to read result file: ${e.message}` }; }
+  try { raw = readFileSync(lastMessagePath, 'utf8'); }
+  catch (e) { return { ok: false, error: `failed to read final message file: ${e.message}` }; }
+  if (!raw.trim()) {
+    return { ok: false, error: 'codex final message was empty' };
+  }
   // Strip a leading ```json fence and trailing ``` if codex wrapped the file
   // despite our instructions — a common pattern for LLMs writing "JSON files".
   const stripped = raw
     .replace(/^\s*```(?:json)?\s*\n/i, '')
     .replace(/\n```\s*$/i, '')
     .trim();
-  let parsed;
-  try { parsed = JSON.parse(stripped); }
-  catch (e) { return { ok: false, error: `result file is not valid JSON: ${e.message}` }; }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    return { ok: false, error: 'result file root is not a JSON object' };
+  // Try strict parse first (the common case if the model behaved).
+  try {
+    const parsed = JSON.parse(stripped);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return { ok: false, error: 'result root is not a JSON object' };
+    }
+    return { ok: true, value: parsed };
+  } catch { /* fall through to lenient extraction */ }
+  // Lenient: scan for the first balanced {...} block, respecting JSON string
+  // quoting (don't count braces inside strings).
+  const block = extractFirstJsonObject(stripped);
+  if (!block) {
+    return { ok: false, error: 'codex final message is not valid JSON and contains no extractable JSON object' };
   }
-  return { ok: true, value: parsed };
+  let parsed;
+  try { parsed = JSON.parse(block); }
+  catch (e) { return { ok: false, error: `extracted JSON candidate failed to parse: ${e.message}` }; }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, error: 'extracted JSON root is not an object' };
+  }
+  return { ok: true, value: parsed, warning: 'codex final message had surrounding non-JSON content; extracted the first JSON object' };
+}
+
+function extractFirstJsonObject(s) {
+  // Brace-depth scan honoring JSON strings + escape sequences. Returns the
+  // matched substring or null if no balanced object is found. Doesn't validate
+  // the JSON — that's JSON.parse's job afterward.
+  const i0 = s.indexOf('{');
+  if (i0 === -1) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = i0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) { esc = false; continue; }
+      if (c === '\\') { esc = true; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return s.slice(i0, i + 1);
+    }
+  }
+  return null;
 }
 
 function normalizeResult(parsed) {
-  // Returns { summary, details, files, warnings[] }. Coerces missing fields
-  // to safe defaults and warns rather than failing — the run still succeeded
-  // even if codex was sloppy about the schema.
   const warnings = [];
   let summary = parsed.summary;
   let details = parsed.details;
@@ -308,7 +463,6 @@ function emit(r, code, outPath) {
   if (outPath) {
     try { writeFileSync(outPath, json); }
     catch (e) {
-      // Already written to stdout — surface to stderr but don't change exit code.
       process.stderr.write(`warning: failed to write --out ${outPath}: ${e.message}\n`);
     }
   }
@@ -333,16 +487,18 @@ async function main() {
       error: `--cwd ${args.cwd || workdir} does not exist`,
       summary: '', details: '', files: {},
       workdir, sessionDir: null,
+      model: args.model, permissions: args.permissions,
       warnings, durationMs: Date.now() - start,
     }, 2, args.out);
   }
 
-  // Per-session tmp dir lives inside the workdir so codex's workspace-write
-  // sandbox covers it (codex is --cd'd to workdir). It's removed on success.
-  const tmpRoot = resolve(workdir, '.codex-task-tmp');
+  // Per-session scratch dir lives in the OS temp area, NOT inside the workdir.
+  // The codex CLI process (NOT the model) writes the agent's final message to
+  // <sessionDir>/last-message.txt via --output-last-message, so this dir is
+  // a wrapper-level write only — model sandbox does not apply.
   const sessionId = `${Date.now()}-${process.pid}`;
-  const sessionDir = join(tmpRoot, sessionId);
-  const resultPath = join(sessionDir, 'result.json');
+  const sessionDir = join(tmpdir(), 'codex-task', sessionId);
+  const lastMessagePath = join(sessionDir, 'last-message.txt');
   try {
     mkdirSync(sessionDir, { recursive: true });
   } catch (e) {
@@ -351,24 +507,34 @@ async function main() {
       error: `failed to create session dir ${sessionDir}: ${e.message}`,
       summary: '', details: '', files: {},
       workdir, sessionDir,
+      model: args.model, permissions: args.permissions,
       warnings, durationMs: Date.now() - start,
     }, 1, args.out);
   }
 
-  const prompt = buildPrompt(args.prompt, resultPath);
+  const prompt = buildPrompt(args.prompt, args.permissions);
+  const spawnArgs = buildSpawnArgs({
+    workdir,
+    lastMessagePath,
+    model: args.model,
+    permissions: args.permissions,
+    search: args.search,
+    profile: args.profile,
+  });
 
   const env = { ...process.env };
   delete env.OPENAI_API_KEY;
 
   let runResult;
   try {
-    runResult = await runCodex({ prompt, env, cwd: workdir, quiet: args.quiet });
+    runResult = await runCodex({ prompt, env, args: spawnArgs, quiet: args.quiet });
   } catch (e) {
     return emit({
       ok: false,
       error: `failed to spawn codex: ${e.message}`,
       summary: '', details: '', files: {},
       workdir, sessionDir,
+      model: args.model, permissions: args.permissions,
       warnings, durationMs: Date.now() - start,
     }, 1, args.out);
   }
@@ -380,11 +546,12 @@ async function main() {
       error: `codex exited with code ${runResult.code}. stderr tail: ${tail}`,
       summary: '', details: '', files: {},
       workdir, sessionDir,
+      model: args.model, permissions: args.permissions,
       warnings, durationMs: Date.now() - start,
     }, 1, args.out);
   }
 
-  const read = readResult(resultPath);
+  const read = readResult(lastMessagePath);
   if (!read.ok) {
     warnings.push(read.error);
     return emit({
@@ -392,26 +559,22 @@ async function main() {
       error: read.error,
       summary: '', details: '', files: {},
       workdir, sessionDir,
+      model: args.model, permissions: args.permissions,
       warnings, durationMs: Date.now() - start,
     }, 1, args.out);
   }
+  if (read.warning) warnings.push(read.warning);
 
   const norm = normalizeResult(read.value);
   warnings.push(...norm.warnings);
 
-  // Cleanup tmp on success unless --debug. Failures keep tmp unconditionally
-  // (we wouldn't reach here on a failure — the early returns above bail out
-  // with sessionDir preserved). Cleanup errors are warnings, not failures.
   let cleanedUp = false;
   if (!args.debug) {
     try {
       rmSync(sessionDir, { recursive: true, force: true });
       cleanedUp = true;
-      // Best-effort: prune the tmpRoot dir if it's now empty, so we don't
-      // leave a stray ".codex-task-tmp/" sitting in the user's project.
-      try { rmSync(tmpRoot, { recursive: false }); } catch { /* not empty, fine */ }
     } catch (e) {
-      warnings.push(`failed to clean up tmp session dir ${sessionDir}: ${e.message}`);
+      warnings.push(`failed to clean up scratch dir ${sessionDir}: ${e.message}`);
     }
   }
 
@@ -422,6 +585,8 @@ async function main() {
     files: norm.files,
     workdir,
     sessionDir: cleanedUp ? null : sessionDir,
+    model: args.model,
+    permissions: args.permissions,
     warnings,
     durationMs: Date.now() - start,
   }, 0, args.out);

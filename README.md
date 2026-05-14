@@ -4,7 +4,7 @@ A small portable tool that lets Claude Code, opencode, Cline, Cursor, or any CLI
 
 Companion to [`codex-image-gen`](https://github.com/NicholasMTElliott/codex-image-gen): same installer patterns, same target registry approach, different runtime payload.
 
-Single mode: feed it a `--prompt` (or `--prompt-file`), it runs `codex exec --full-auto` against your project, and emits JSON like:
+Single mode: feed it a `--prompt` (or `--prompt-file`), it runs `codex exec` against your project, and emits JSON like:
 
 ```json
 {
@@ -17,14 +17,18 @@ Single mode: feed it a `--prompt` (or `--prompt-file`), it runs `codex exec --fu
     "tests/paths.test.js": "edited",
     "src/legacy.js": "referenced"
   },
-  "workdir": "/abs/path/to/project",
-  "sessionDir": null,
-  "warnings": [],
-  "durationMs": 84210
+  "workdir":     "/abs/path/to/project",
+  "sessionDir":  null,
+  "model":       "gpt-5.5",
+  "permissions": "workspace-write",
+  "warnings":    [],
+  "durationMs":  84210
 }
 ```
 
 Action values for each touched file are one of `created`, `deleted`, `edited`, or `referenced`. The parent agent (Claude Code etc.) can use this to audit what changed without reading codex's full transcript.
+
+**Default permissions are `read-only`** — codex can read your project but cannot modify any files. Pair with `--permissions workspace-write` (or `full-auto`) when you want codex to actually edit. `read-only` is the right default for the bulk of delegated work: investigations, audits, codebase questions, multi-file analysis.
 
 Ships with an Anthropic-style `SKILL.md` that the installer registers with each detected coding-agent harness (Claude Code, opencode, Cline, Cursor, …) so the agent knows when and how to invoke it.
 
@@ -99,18 +103,28 @@ node install.mjs --uninstall
 
 ## Manual invocation
 
-POSIX (bash/zsh):
+POSIX (bash/zsh) — read-only investigation (default permissions):
 
 ```bash
 node ~/.codex-task/codex-task.mjs \
+  --prompt "Find every place in this repo that imports lodash.merge and list options for replacing each one."
+```
+
+Refactor (writes files — opt in with `--permissions`):
+
+```bash
+node ~/.codex-task/codex-task.mjs \
+  --permissions workspace-write \
   --prompt "Rename getCwd to getCurrentWorkingDirectory across the repo, including tests."
 ```
 
-With a long brief from a file:
+With a long brief from a file, a specific model, and persistent output:
 
 ```bash
 node ~/.codex-task/codex-task.mjs \
   --prompt-file ./refactor-brief.md \
+  --permissions workspace-write \
+  --model gpt-5.5-codex \
   --cwd path/to/project \
   --out /tmp/refactor-result.json
 ```
@@ -119,18 +133,38 @@ Windows PowerShell — `~` does not expand in arguments, use `$env:USERPROFILE`:
 
 ```powershell
 node "$env:USERPROFILE\.codex-task\codex-task.mjs" `
-  --prompt "Rename getCwd to getCurrentWorkingDirectory across the repo, including tests."
+  --prompt "Find every place in this repo that imports lodash.merge and list options for replacing each one."
 ```
 
-Output is JSON on stdout. Codex's own progress chatter streams live to stderr by default so you can follow what it's doing; pass `--quiet` to suppress that stream. The interim per-session work dir under `<workdir>/.codex-task-tmp/<sessionId>/` is removed automatically on success — pass `--debug` to keep it, and failures always preserve it for debugging.
+Output is JSON on stdout. Codex's own progress chatter streams live to stderr by default so you can follow what it's doing; pass `--quiet` to suppress that stream. The per-session scratch dir lives under your OS temp directory (not inside the project), is removed automatically on success, and is preserved on failure — `sessionDir` in the JSON output points at it.
 
 ### Parameters
 
-- `--prompt` (required if `--prompt-file` not given). Inline task description. Anything you'd tell codex to do.
-- `--prompt-file` (required if `--prompt` not given; mutually exclusive with `--prompt`). Path to a UTF-8 text file containing the task description. Use for long multi-line briefs that don't shell-escape cleanly. Trailing whitespace trimmed; internal newlines preserved.
-- `--cwd` (optional). Working directory codex operates inside (relative to caller cwd, or absolute). Default: caller cwd. Codex's `workspace-write` permission is confined to this directory — bounds the blast radius of the task.
-- `--out` (optional). Also write the result JSON to this file path (still printed to stdout). Useful for piping or persistence.
-- `--debug` (optional flag). Keep the per-session tmp dir on success. Default cleans it up to minimize disk impact. Failed runs always preserve tmp regardless.
+#### Task input (one required)
+
+- `--prompt` — inline task description. Anything you'd tell codex to do.
+- `--prompt-file` — path to a UTF-8 text file containing the task description. Mutually exclusive with `--prompt`. Trailing whitespace trimmed; internal newlines preserved.
+
+#### Workspace
+
+- `--cwd` (optional). Working directory codex operates inside (relative to caller cwd, or absolute). Default: caller cwd. Codex's sandbox is bounded by this directory (modulo `--permissions danger-full-access`).
+
+#### Codex pass-throughs
+
+- `--model` (optional, default `gpt-5.5`). Model codex should use. The set of supported values is plan-dependent — codex validates server-side and returns an error for anything your plan doesn't include. Common known names: `gpt-5.5`, `gpt-5.5-codex`, `gpt-5`, `gpt-5-codex`.
+- `--permissions` (optional, default `read-only`). Sandbox policy for codex. Maps to codex's `--sandbox`:
+  - `read-only` (default) — codex can read but not modify any file in the workspace.
+  - `workspace-write` — codex can read AND write inside `--cwd`. Files outside the workdir remain read-only.
+  - `full-auto` — alias for `workspace-write` (matches the historical `codex --full-auto` shorthand).
+  - `danger-full-access` — codex can read AND write anywhere on the filesystem.
+
+  The structured result is captured via codex's `--output-last-message` flag (a codex-process write, not a model write), so it works under any sandbox mode including `read-only`.
+- `--profile` (optional). Codex config profile name. If set, codex loads option defaults from this profile in `~/.codex/config.toml`.
+
+#### Wrapper options
+
+- `--out` (optional). Also write the result JSON to this file path (still printed to stdout).
+- `--debug` (optional flag). Keep the per-session scratch dir on success. Default cleans it up. Failed runs always preserve scratch regardless.
 - `--quiet` (optional flag). Discard codex's live log output instead of streaming it to stderr.
 
 ### Output JSON shape
@@ -138,17 +172,19 @@ Output is JSON on stdout. Codex's own progress chatter streams live to stderr by
 ```json
 {
   "ok": true,
-  "summary":    "<one or two sentences>",
-  "details":    "<markdown>",
-  "files":      { "<path>": "created|deleted|edited|referenced", ... },
-  "workdir":    "<absolute --cwd>",
-  "sessionDir": null,
-  "warnings":   [],
-  "durationMs": 12345
+  "summary":     "<one or two sentences>",
+  "details":     "<markdown>",
+  "files":       { "<path>": "created|deleted|edited|referenced", ... },
+  "workdir":     "<absolute --cwd>",
+  "sessionDir":  null,
+  "model":       "<model used>",
+  "permissions": "<permissions mode used>",
+  "warnings":    [],
+  "durationMs":  12345
 }
 ```
 
-`ok` is `true` only when codex exits cleanly AND produces a parseable result file with a non-null root object. On `false`, an additional `error` field is populated, and `sessionDir` is preserved so you can inspect codex's interim output.
+`ok` is `true` only when codex exits cleanly AND its final message parses as a JSON object with a non-null root. On `false`, an additional `error` field is populated, and `sessionDir` is preserved so you can inspect codex's interim output.
 
 `files` action values are one of:
 
@@ -169,7 +205,7 @@ Example dialogue (Claude Code):
 
 > **You:** I want to rename `getCwd` to `getCurrentWorkingDirectory` everywhere it appears in this repo, including tests. Use codex-task — I'd rather not burn this conversation on it.
 >
-> **Claude:** *(invokes `node ~/.codex-task/codex-task.mjs --prompt "Rename getCwd to getCurrentWorkingDirectory across this repo. Update every call site, every import, every test. Do not change anything else."`, waits ~60s while codex's progress streams to the terminal, then reads the JSON and surfaces the `summary` + `files` to you)*
+> **Claude:** *(invokes `node ~/.codex-task/codex-task.mjs --permissions workspace-write --prompt "Rename getCwd to getCurrentWorkingDirectory across this repo. Update every call site, every import, every test. Do not change anything else."`, waits ~60s while codex's progress streams to the terminal, then reads the JSON and surfaces the `summary` + `files` to you)*
 
 The same rendered `SKILL.md` is dropped into every target harness's skills dir, so the experience is identical from Claude Code, opencode, Cline, Cursor, or any other harness that reads Anthropic-style skill frontmatter (`name` + `description`). Harnesses that don't recognize the `allowed-tools` field simply ignore it.
 
@@ -202,7 +238,7 @@ The installer is idempotent: re-running overwrites the installed copy in `~/.cod
 
 3. **Quota exhausted** — codex returns a quota error. Wait for the 5-hour rolling window to reset, or upgrade your ChatGPT plan.
 
-4. **`error: "result file not written by codex…"`** — codex finished cleanly but didn't produce the structured result file. Probably the prompt confused it (e.g. you asked an open-ended question that codex answered conversationally without performing any task). Re-run with a clearer brief, or pass `--debug` and inspect `sessionDir` to see codex's actual output.
+4. **`error: "codex did not write a final message file…"`** or **`"codex final message was empty"`** — codex finished cleanly but produced no final-message text. Probably the prompt confused it (e.g. you asked an open-ended question that codex answered conversationally without performing any task). Re-run with a clearer brief, or pass `--debug` and inspect `sessionDir` to see codex's actual output.
 
 5. **Skill not auto-invoked from your agent** — verify install state with `node install.mjs --list-targets`, then for each detected harness check the skill file exists and contains an absolute path (no `<<INSTALL_PATH>>` / `<<SCRIPT_PATH>>` placeholders left). **Restart the agent** if it was running when you installed.
 
@@ -220,9 +256,12 @@ The installer is idempotent: re-running overwrites the installed copy in `~/.cod
 - **Why we delete `OPENAI_API_KEY`**: codex routes to API billing if it sees that variable, silently. We force subscription routing by stripping it from the spawned env.
 - **Why we don't override `CODEX_HOME`**: codex stores its ChatGPT auth there. Override → fresh-install state → no auth → 401.
 - **Why prompt is piped via stdin**: `codex exec` accepts the prompt as a positional arg, but on Windows with `shell:true` (required to spawn `codex.cmd` post-CVE-2024-27980) Node concatenates args without escaping, so a multi-word prompt gets split. Stdin sidesteps the issue.
-- **Why `--full-auto`**: skips codex's per-shell-command approval prompts so the workflow is hands-off. Trade-off: codex can't pause to ask questions, so the parent agent must specify the task up-front.
-- **Why `--cd` to the user's workdir, not a sandbox**: unlike `codex-image-gen` (which sandboxes codex in a fresh tmp dir for image generation), `codex-task` deliberately points codex at the user's project. The whole point is to perform work on the user's files. The blast radius is bounded by codex's `workspace-write` sandbox, which is in turn confined to `--cd`.
-- **Why a separate result file rather than parsing stdout**: codex's `exec` stdout is verbose and meant for humans — reasoning traces, partial outputs, tool-call chatter. Asking codex to write a single result file at a known path is far more reliable than asking it to emit clean JSON to stdout interspersed with its normal output. As a bonus, it leaves stdout free for live progress streaming.
+- **Why hands-off operation**: the wrapper always passes `--ask-for-approval never` (and historically `--full-auto`, which is the same combination plus `workspace-write`). Trade-off: codex can't pause to ask questions, so the parent agent must specify the task up-front.
+- **Why `read-only` is the default**: most delegated agent work is investigation — "find every X", "summarize Y", "audit Z". Defaulting to a sandbox that can't modify the user's project makes "I tried codex-task and it broke my repo" impossible by construction. Refactors/edits opt in via `--permissions workspace-write`.
+- **Why the scratch dir lives in OS temp, not in the workdir**: keeps the user's project clean of wrapper artifacts (no `.codex-task-tmp/` to add to `.gitignore`). Codex itself writes the agent's final message into the scratch dir via `--output-last-message`, which is a wrapper-process write and is unaffected by `--sandbox` — so `read-only` works end-to-end without needing any write-access concessions in the model sandbox.
+- **Why `--cd` to the user's workdir, not a sandbox**: unlike `codex-image-gen` (which sandboxes codex in a fresh tmp dir for image generation), `codex-task` deliberately points codex at the user's project. The whole point is to perform work on the user's files. The blast radius is bounded by codex's `--sandbox` policy, which is in turn confined to `--cd` (plus the scratch dir).
+- **Why `--ephemeral` by default**: this is a one-shot delegated task, not part of a persisted interactive session. We don't want every codex-task invocation cluttering codex's session history.
+- **Why `--output-last-message` instead of parsing stdout**: codex's `exec` stdout is verbose — reasoning traces, tool-call chatter, partial outputs — and meant for humans. `--output-last-message` tells codex's CLI process to write *just* the agent's final message text to a file after the run, no interleaving. We tell the model in the prompt that its final message must be a single JSON object, and parse the file we get back. As a bonus, this leaves stdout free for live progress streaming.
 - **Why coerce unknown action verbs to `referenced`**: codex occasionally returns synonyms like `"modified"` or `"updated"`. Rejecting the whole run for a synonym would be hostile to callers; the wrapper rewrites and warns instead. The schema's `files` map is always one of the four canonical verbs.
 
 ## Compatibility notes

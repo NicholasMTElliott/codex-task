@@ -7,20 +7,38 @@ Single-process Node ESM script. No daemon, no state, no IPC beyond the spawned c
 caller (Claude Code / opencode / shell)
    │  --prompt / --prompt-file
    │  --cwd / --out / --debug / --quiet
+   │  --model / --permissions / --profile
    ▼
 codex-task.mjs
-   │  parseArgs → resolve workdir → mkdir <workdir>/.codex-task-tmp/<sessionId>/
-   │  buildPrompt (wrap user task with JSON-output instructions
-   │               pointing at <sessionDir>/result.json)
-   │  spawn('codex', ['exec','--full-auto','--skip-git-repo-check','--cd', workdir]),
-   │     env without OPENAI_API_KEY, prompt via stdin
+   │  parseArgs → resolve workdir → mkdir <os.tmpdir()>/codex-task/<sessionId>/
+   │  buildPrompt (tell model: your FINAL message must be a single JSON
+   │               object of this shape; add a read-only addendum when
+   │               --permissions=read-only so codex knows to describe
+   │               edits in details rather than fail on writes)
+   │  buildSpawnArgs:
+   │    codex exec
+   │      --skip-git-repo-check
+   │      --ephemeral
+   │      --sandbox <mapped from --permissions>
+   │      --cd <workdir>
+   │      --model <model>
+   │      --output-last-message <sessionDir>/last-message.txt
+   │      [--profile <name>]       # if provided
+   │  spawn with env minus OPENAI_API_KEY; prompt piped via stdin
    │  codex stdout/stderr → user's stderr (live progress) unless --quiet
    ▼
 codex CLI (ChatGPT-authed)
-   │  reads/writes files inside workdir per workspace-write permission
-   │  writes result.json to <sessionDir>/result.json
+   │  reads/writes files per --sandbox policy
+   │  AFTER agent exits: codex's CLI process writes the agent's final
+   │  message text to <sessionDir>/last-message.txt. This is a wrapper-
+   │  process write, NOT a model-driven write, so it bypasses --sandbox
+   │  entirely — works under read-only.
    ▼
-readResult (strip ```json fences, JSON.parse) →
+readResult:
+   read last-message.txt → strip ```json fences →
+   try strict JSON.parse → on failure, extract first balanced {...} block
+                            (string-quote-aware brace counting) →
+   try JSON.parse on the extracted block
 normalizeResult (coerce unknown action verbs to "referenced",
                  coerce missing fields with warnings) →
 rmSync(<sessionDir>) unless --debug or !ok →
@@ -34,16 +52,22 @@ emit JSON to stdout (and optionally --out file)
 - **Strip `OPENAI_API_KEY`** from spawned env. If codex sees it, it silently switches to API billing.
 - **Do not override `CODEX_HOME`.** Codex stores ChatGPT auth there; overriding → fresh-install state → 401. Codex#11435 parallel-corruption only matters concurrently; this tool is serial-by-design.
 - **Prompt via stdin, not argv.** On Windows `shell:true` is required to spawn `codex.cmd` (post-CVE-2024-27980), but Node concatenates args without escaping under `shell:true`, so multi-word prompts split. Stdin sidesteps this.
-- **`--cd` to the user's workdir, not a sandbox.** Unlike `codex-image-gen` which sandboxes codex in a fresh tmp dir, `codex-task` deliberately points codex at the user's project (or a `--cwd` override). The whole point is for codex to perform work on the user's files. The blast radius is bounded by codex's `workspace-write` sandbox, which is in turn confined to the `--cd` target.
-- **`--full-auto`.** Skips per-shell-command approval prompts so the workflow is hands-off. Trade-off: codex can't pause to ask questions. The parent agent must specify the task up-front.
-- **`--skip-git-repo-check`.** Users will run this inside their own (often untrusted-to-codex) repos. We've already accepted `--full-auto`; skipping the trust prompt is consistent with that choice.
+- **`--cd` to the user's workdir, not a sandbox.** Unlike `codex-image-gen` which sandboxes codex in a fresh tmp dir, `codex-task` deliberately points codex at the user's project. The whole point is for codex to perform work on the user's files. The blast radius is bounded by codex's `--sandbox` policy (settable via our `--permissions`), which is in turn confined to `--cd`.
+- **`read-only` is the default permission.** Most delegated agent work is investigation, not modification — "find every X", "summarize Y", "audit Z". Defaulting the sandbox to read-only makes "I tried codex-task and it broke my repo" impossible by construction. Refactors / edits opt in via `--permissions workspace-write` (or `full-auto` alias).
+- **Scratch dir lives in OS temp, NOT inside the workdir.** Path: `<os.tmpdir()>/codex-task/<sessionId>/`. Contains a single file `last-message.txt`. Side benefit: user's project is never polluted with a wrapper-owned dir, so nothing to add to `.gitignore`.
+- **Structured result via `--output-last-message`, not a model-written file.** Codex's `--output-last-message <path>` flag tells the codex CLI process to write the agent's FINAL message text to a file *after* the agent exits. This is a wrapper-process write — the model sandbox does NOT apply — so it works under any `--sandbox` policy including `read-only`. Empirically verified against codex 0.128.0. We attempted the alternative (model writes result.json itself, with `--add-dir <sessionDir>` granting write access) but `--add-dir` does NOT override `--sandbox read-only`; the model's writes were blocked by the read-only policy with `patch rejected: writing is blocked by read-only sandbox`.
+- **`--ephemeral` always.** Each invocation is a one-shot delegated task, not part of a persisted interactive session. We don't want to clutter codex's session history with wrapper-driven exec runs.
+- **Approval policy is `never` by default in `codex exec`.** We rely on this default rather than passing `--ask-for-approval` ourselves, because `--ask-for-approval` is a top-level `codex` flag and is NOT exposed on the `exec` subcommand (passing it crashes with "unexpected argument"). Codex's `exec` run header confirms `approval: never` without us doing anything.
+- **`--skip-git-repo-check`.** Users will run this inside their own (often untrusted-to-codex) repos. We've already accepted hands-off operation; skipping the trust prompt is consistent.
 - **Posix-style path inside the prompt** (`replace(/\\/g, '/')`) — codex normalizes both, but forward slashes avoid backslash-escape ambiguity in tool-call parsing.
-- **Tmp dir inside the workdir, not under `/tmp` or HOME.** Codex's `workspace-write` permission is confined to `--cd <workdir>`, so the result file must live inside that workdir. Path: `<workdir>/.codex-task-tmp/<sessionId>/result.json`. The tmp root is single-purpose and gitignore-able; on success we also try to remove the tmp root if it's now empty so we don't leave a stray dir.
+- **Conditional prompt addendum under `read-only`.** When `--permissions=read-only` is set, the prompt explicitly tells codex to describe intended edits in `details` rather than fail on writes. Without this, codex might attempt writes, hit sandbox denials, and produce a degraded result. With it, codex knows up front that it's in audit mode. The structured result still gets delivered via `--output-last-message` regardless.
 - **Live codex output streams to *our* stderr.** Final JSON goes to stdout; codex's progress chatter goes to stderr so pipes that consume our stdout (e.g. `node codex-task.mjs … | jq .summary`) get exactly one valid JSON document. `--quiet` discards the stderr stream entirely (still captures a 4KB tail for failure reporting).
-- **Markdown-fence stripping in the result file.** LLMs love to wrap "JSON files" in ` ```json ` fences despite explicit instructions. We strip a leading fence and trailing ``` before parsing — common-case lenience without sacrificing the strict-shape contract.
+- **Markdown-fence stripping + lenient JSON extraction.** LLMs love to wrap their "JSON" final messages in ` ```json ` fences or sprinkle in commentary despite explicit instructions. We strip a leading fence and trailing ```, then try strict `JSON.parse`. On failure, we fall back to scanning for the first balanced `{...}` block (depth-aware, JSON-string-quote-aware) and parsing that — with a warning. Common-case lenience without sacrificing the strict-shape contract.
 - **Unknown action verbs are demoted, not rejected.** If codex returns `"modified"` or `"updated"` for a file action, we coerce to `"referenced"` and emit a warning. Rationale: the wrapper's job is to give the parent agent a stable schema; rejecting the whole run because codex used a synonym would be hostile. The warning surfaces the issue for tightening prompts later.
-- **Cleanup-on-success default.** On `ok && !--debug`, `rmSync(sessionDir, {recursive:true, force:true})` runs before emit. Failed runs preserve tmp unconditionally so the user can investigate. Cleanup failures are non-fatal — recorded as a warning, the run still reports `ok:true`.
+- **Cleanup-on-success default.** On `ok && !--debug`, `rmSync(sessionDir, {recursive:true, force:true})` runs before emit. Failed runs preserve scratch unconditionally so the user can investigate. Cleanup failures are non-fatal — recorded as a warning, the run still reports `ok:true`.
 - **Soft schema validation, not strict.** Missing `summary` / `details` / `files` → coerced to empty defaults with a warning, run still succeeds. Hard failures are reserved for: codex exiting non-zero, no result file written, result file not valid JSON, or root not an object.
+- **Model passes through; no client-side validation.** The set of supported models is plan-dependent and not enumerable. Codex validates server-side and returns 400 with a clear message ("not supported when using Codex with a ChatGPT account") which surfaces to the wrapper's `error` field. Wrapper just lists common known names in `--help` as hints.
+- **`--permissions full-auto` is an alias for `workspace-write`.** Codex's historical `--full-auto` was `workspace-write` + `never` approval. Since we always pass `never`, our `full-auto` and `workspace-write` produce the same spawn args. Keeping both names lets users familiar with the old codex flag use a recognizable term.
 
 ## Component relationships
 
@@ -57,26 +81,30 @@ emit JSON to stdout (and optionally --out file)
 Same `TARGETS` registry pattern as `codex-image-gen`. See `codex-image-gen/memory-bank/systemPatterns.md` for the full flow — only the install dir (`~/.codex-task/`) and skill subfolder name (`codex-task`) differ.
 
 ### Run
-1. `parseArgs(process.argv.slice(2))` — resolve `--prompt` / `--prompt-file` (mutually exclusive; UTF-8 read with `.trim()`, empty-after-trim rejected); resolve `--cwd` (relative or absolute; defaults to caller cwd; must exist or exit 2); parse flags. `-h`/`--help` prints usage to stdout, exits 0.
-2. Make `<workdir>/.codex-task-tmp/<sessionId>/` with `<sessionId>` = `<timestamp>-<pid>`. Pre-allocate the result-file path inside.
-3. Build the wrapper prompt: fixed preamble explaining JSON shape + the user's task verbatim + the result-file path (posix-slash).
-4. Spawn `codex exec --full-auto --skip-git-repo-check --cd <workdir>` with `OPENAI_API_KEY` deleted. Stdout/stderr inherit by default (live to user); `--quiet` switches stdout to ignore and stderr to a 4KB-capped pipe. Prompt via stdin.
-5. On spawn failure → emit `ok:false` with `error: "failed to spawn codex: …"`. Tmp preserved.
-6. On non-zero exit → emit `ok:false` with `error: "codex exited with code N. stderr tail: …"`. Tmp preserved. Stderr tail only available under `--quiet` (otherwise codex's output already went to the user's terminal).
-7. On zero exit → read `<sessionDir>/result.json`:
-   - File missing → emit `ok:false`, "result file not written by codex at …". Tmp preserved.
-   - Read fails → emit `ok:false`, "failed to read result file: …". Tmp preserved.
+1. `parseArgs(process.argv.slice(2))` — resolve `--prompt` / `--prompt-file` (mutually exclusive; UTF-8 read with `.trim()`, empty-after-trim rejected); resolve `--cwd` (relative or absolute; defaults to caller cwd; must exist or exit 2); validate `--permissions` against `read-only|workspace-write|full-auto|danger-full-access` (default `read-only`); take `--model` verbatim (default `gpt-5.5`) and pass `--profile` through if present. `-h`/`--help` prints usage to stdout, exits 0.
+2. Make `<os.tmpdir()>/codex-task/<sessionId>/` with `<sessionId>` = `<timestamp>-<pid>`. Pre-allocate the result-file path inside.
+3. Build the wrapper prompt: fixed preamble telling the model its FINAL message must be a single JSON object of a specific shape + user task + (when `--permissions=read-only`) a read-only addendum telling codex to describe intended edits in `details` rather than fail on writes.
+4. Build the spawn args: `exec --skip-git-repo-check --ephemeral --sandbox <mapped> --cd <workdir> --model <model> --output-last-message <sessionDir>/last-message.txt`, plus `--profile <name>` if provided. Approval defaults to `never` automatically in `codex exec`. Web search is intentionally NOT exposed — `--search` is a top-level codex flag, not available on `codex exec`, and the underlying feature flags are deprecated.
+5. Spawn with `OPENAI_API_KEY` deleted. Stdout/stderr inherit by default (live to user); `--quiet` switches stdout to ignore and stderr to a 4KB-capped pipe. Prompt via stdin.
+6. On spawn failure → emit `ok:false` with `error: "failed to spawn codex: …"`. Scratch preserved.
+7. On non-zero exit → emit `ok:false` with `error: "codex exited with code N. stderr tail: …"`. Scratch preserved. Stderr tail only available under `--quiet` (otherwise codex's output already went to the user's terminal).
+8. On zero exit → read `<sessionDir>/last-message.txt`:
+   - File missing → emit `ok:false`, "codex did not write a final message file at …". Scratch preserved.
+   - Empty file → emit `ok:false`, "codex final message was empty". Scratch preserved.
    - Strip optional leading ` ```json ` fence and trailing ``` if present.
-   - `JSON.parse` fails → emit `ok:false`, "result file is not valid JSON: …". Tmp preserved.
-   - Root not an object → emit `ok:false`, "result file root is not a JSON object". Tmp preserved.
-8. `normalizeResult(parsed)` — coerce missing/wrong-type `summary`/`details`/`files` to safe defaults with warnings; iterate `files`, coerce unknown action verbs to `"referenced"` with per-entry warnings.
-9. Unless `--debug`: `rmSync(sessionDir, {recursive:true, force:true})`. Best-effort prune of `tmpRoot` if it's now empty. Failures recorded as warnings, run still `ok:true`.
-10. Emit JSON: `{ ok, summary, details, files, workdir, sessionDir: null|<path>, warnings, durationMs }`. Also write to `--out` path if set. Exit 0.
+   - Try strict `JSON.parse`; on failure scan for the first balanced `{...}` block and parse that (with a warning if it works).
+   - All extraction paths fail → emit `ok:false` describing the failure. Scratch preserved.
+   - Root not an object → emit `ok:false`, "result root is not a JSON object". Scratch preserved.
+9. `normalizeResult(parsed)` — coerce missing/wrong-type `summary`/`details`/`files` to safe defaults with warnings; iterate `files`, coerce unknown action verbs to `"referenced"` with per-entry warnings.
+10. Unless `--debug`: `rmSync(sessionDir, {recursive:true, force:true})`. Failures recorded as warnings, run still `ok:true`.
+11. Emit JSON: `{ ok, summary, details, files, workdir, sessionDir: null|<path>, model, permissions, warnings, durationMs }`. Also write to `--out` path if set. Exit 0.
 
 ## Invariants
 - A single run is always serial. Never spawn multiple codex children in parallel.
 - Session dirs are unique per invocation: `<timestamp>-<pid>`.
+- Session dirs live outside the user's workdir — always under `<os.tmpdir()>/codex-task/`.
 - Stdout output is always a single valid JSON object — never partial, never interleaved with codex chatter, even on failure paths.
 - The result schema's `files` map always uses one of the four allowed action verbs. Anything else is rewritten to `"referenced"` with a warning before emit.
+- The JSON always surfaces `model` and `permissions` — even on failure — so the caller can see what the wrapper actually asked codex to do.
 - On `ok: true`, `summary` / `details` / `files` are present (possibly empty strings / empty object) and `sessionDir` is `null` (cleaned up) unless `--debug`.
-- On `ok: false`, `sessionDir` is non-null and points at the preserved tmp dir.
+- On `ok: false`, `sessionDir` is non-null and points at the preserved scratch dir.

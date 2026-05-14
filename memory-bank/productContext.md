@@ -15,30 +15,34 @@ Billing flows through the ChatGPT subscription as long as `OPENAI_API_KEY` is un
 
 ### Inputs
 - `--prompt` / `--prompt-file` — the task description. Inline or from a UTF-8 text file. Mutually exclusive. File variant useful for long multi-line briefs that don't shell-escape cleanly; trailing whitespace trimmed, internal newlines preserved.
-- `--cwd` — working directory codex operates inside (relative or absolute; default: caller cwd). Codex's `workspace-write` permission is confined to this directory, so it bounds the blast radius of the task.
+- `--cwd` — working directory codex operates inside (relative or absolute; default: caller cwd). Codex's sandbox is bounded by this directory (modulo `--permissions danger-full-access`).
+- `--model` — codex model name. Default: `gpt-5.5`. The supported set is plan-dependent and not enumerable from the CLI; codex returns 400 with "not supported when using Codex with a ChatGPT account" for anything the user's plan doesn't include. Common known values surfaced in `--help`: `gpt-5.5`, `gpt-5.5-codex`, `gpt-5`, `gpt-5-codex`.
+- `--permissions` — sandbox policy. Default `read-only`. Values: `read-only` (codex can read but not modify the workspace), `workspace-write` (codex can read AND write inside `--cwd`), `full-auto` (alias for `workspace-write`), `danger-full-access` (codex can write anywhere). Maps to codex's `--sandbox` flag. Approval is always `never` in the wrapper since it's non-interactive.
+- `--profile` — optional codex config profile name (pass-through to codex's `--profile`).
 - `--out` — also write the result JSON to this file path (still printed to stdout). Useful for piping or persistence.
-- `--debug` — preserve the per-session tmp dir on success (default cleans it up; failures always preserve).
+- `--debug` — preserve the per-session scratch dir on success (default cleans it up; failures always preserve).
 - `--quiet` — discard codex's live log output instead of streaming it to stderr.
 
 ### Behavior
-- The tool builds a wrapper prompt: it prepends a fixed preamble explaining the JSON shape codex must write, includes the user's task, and ends with the result-file path.
-- Spawns `codex exec --full-auto --skip-git-repo-check --cd <workdir>` with `OPENAI_API_KEY` deleted, prompt piped via stdin.
-- Codex's stdout streams **live** to our stderr (so the user can follow progress) unless `--quiet`. Our stdout is reserved for the final JSON result.
-- After codex exits cleanly, the tool reads `<workdir>/.codex-task-tmp/<sessionId>/result.json`, validates the shape, normalizes any sloppy fields (coerces unknown action verbs to `referenced` with a warning), and emits the final JSON.
-- Strips a leading ` ```json ` fence and trailing ``` from the result file if codex wrapped it in markdown despite instructions.
-- On success without `--debug`, removes the session tmp dir. On failure or `--debug`, preserves it; failures surface `sessionDir` in the JSON so the caller can inspect codex's interim output.
+- The tool builds a wrapper prompt: a fixed preamble explaining that the agent's FINAL message must be a single JSON object of a specific shape (with a `read-only`-aware addendum when applicable), followed by the user's task.
+- Spawns `codex exec` with `--skip-git-repo-check`, `--ephemeral`, `--sandbox <mapped from --permissions>`, `--cd <workdir>`, `--model <model>`, `--output-last-message <sessionDir>/last-message.txt`, plus `--profile <name>` conditionally. `OPENAI_API_KEY` is deleted from the spawned env. Prompt is piped via stdin.
+- Codex's stdout/stderr streams **live** to our stderr (so the user can follow progress) unless `--quiet`. Our stdout is reserved for the final JSON result.
+- After codex exits cleanly, the tool reads `<sessionDir>/last-message.txt` (codex's CLI process writes this — bypasses the model sandbox), tries strict `JSON.parse`, falls back to fence stripping and balanced-brace extraction if the model added prose around the JSON, validates the shape, normalizes any sloppy fields (coerces unknown action verbs to `referenced` with a warning), and emits the final JSON.
+- On success without `--debug`, removes the scratch dir. On failure or `--debug`, preserves it; failures surface `sessionDir` in the JSON so the caller can inspect codex's interim output.
 
 ### Output (JSON on stdout)
 ```json
 {
   "ok": true,
-  "summary":    "<one or two sentences>",
-  "details":    "<markdown>",
-  "files":      { "<path>": "created|deleted|edited|referenced", ... },
-  "workdir":    "<absolute path codex was --cd'd to>",
-  "sessionDir": null,
-  "warnings":   [],
-  "durationMs": 12345
+  "summary":     "<one or two sentences>",
+  "details":     "<markdown>",
+  "files":       { "<path>": "created|deleted|edited|referenced", ... },
+  "workdir":     "<absolute path codex was --cd'd to>",
+  "sessionDir":  null,
+  "model":       "<model used>",
+  "permissions": "<permissions mode used>",
+  "warnings":    [],
+  "durationMs":  12345
 }
 ```
 
@@ -46,7 +50,8 @@ On failure: `ok: false`, an `error` field with a stderr tail or parse-failure me
 
 ## UX expectations
 - The wrapper takes whatever the underlying codex run takes, typically 15s for trivial codebase questions, 1-5 minutes for multi-file refactors, longer for exploratory investigation. There is no progress signal beyond codex's live chatter on stderr.
-- The `.codex-task-tmp/` dir appears in the working directory only briefly on success; it persists on failure. Users should add it to `.gitignore`.
+- The scratch dir lives outside the user's project (under OS tmp), so the workdir is never polluted with a wrapper-owned folder. Nothing to add to `.gitignore`.
 - The structured JSON is the canonical handoff. The `summary` field is the one to surface to the human user; `details` is for the parent agent to read; `files` is for the parent agent to audit.
-- Codex runs in `--full-auto` — no interactive prompts. The wrapper is unsuitable for tasks that need clarifying questions; the parent agent must specify them up-front.
-- Failures (`ok: false`) preserve tmp regardless of `--debug`; users can inspect codex's interim output without re-running.
+- Codex runs non-interactively with `--ask-for-approval never` — no clarifying questions, no per-command prompts. The parent agent must specify the task fully up-front.
+- The `read-only` default permission means the wrapper is safe to invoke for investigations without worry about codex modifying the workspace. Refactors and edits require opting in via `--permissions workspace-write` (or the `full-auto` alias). The wrapper documents this trade-off heavily in the prompt under `read-only` so codex describes intended edits in `details` rather than failing when its writes are blocked.
+- Failures (`ok: false`) preserve the scratch dir regardless of `--debug`; users can inspect codex's interim output without re-running.
