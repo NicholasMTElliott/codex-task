@@ -13,6 +13,7 @@ dist/
 build/
 coverage/
 .nyc_output/
+tmp/
 
 # Env
 .env

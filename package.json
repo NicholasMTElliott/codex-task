@@ -30,12 +30,13 @@
     "codex-task": "./codex-task.mjs"
   },
   "scripts": {
-    "check": "node --check codex-task.mjs && node --check install.mjs",
+    "check": "node --check codex-task.mjs && node --check install.mjs && node --check scripts/permission-matrix.mjs",
     "test": "node --test"
   },
   "files": [
     "codex-task.mjs",
     "install.mjs",
+    "scripts/permission-matrix.mjs",
     "SKILL.md",
     "README.md",
     "LICENSE"

@@ -13,9 +13,10 @@
  * Output: JSON on stdout with shape:
  *   {
  *     "ok": true,
+ *     "taskResult": "completed",
  *     "summary": "...",
  *     "details": "...",
- *     "files": { "<path>": "<created|deleted|edited|referenced>", ... },
+ *     "files": { "<path>": "<created|deleted|edited>", ... },
  *     "workdir":   "<absolute path codex was --cd'd to>",
  *     "sessionDir":"<absolute OS-tmp session dir, removed on success>",
  *     "model":     "<model used>",
@@ -24,8 +25,9 @@
  *     "durationMs": 12345
  *   }
  *
- * Codex's own log output streams live to stderr so callers can follow
- * progress; structured stdout is the JSON only (always last, always valid).
+ * Codex's own log output is captured silently by default. Pass
+ * --stream-thinking to mirror it live to stderr. Structured stdout is the
+ * JSON only (always last, always valid).
  *
  * Subscription billing requires OPENAI_API_KEY to be UNSET in the spawned env
  * — if present, codex silently switches to API token billing. We deliberately
@@ -54,6 +56,7 @@ process.on('warning', (w) => {
 // Allowed action verbs in the result.files map. Anything else gets demoted
 // to "referenced" with a warning; we never reject the run for a stray verb.
 const ALLOWED_ACTIONS = new Set(['created', 'deleted', 'edited', 'referenced']);
+const ALLOWED_TASK_RESULTS = new Set(['completed', 'partial', 'blocked', 'failed']);
 
 // Default model. The set of supported models is plan-dependent and not
 // enumerable from the CLI — codex validates server-side and returns 400 for
@@ -62,13 +65,10 @@ const ALLOWED_ACTIONS = new Set(['created', 'deleted', 'edited', 'referenced']);
 const DEFAULT_MODEL = 'gpt-5.5';
 const KNOWN_MODEL_HINTS = ['gpt-5.5', 'gpt-5.5-codex', 'gpt-5', 'gpt-5-codex'];
 
-// --permissions values map to (codex --sandbox) values. "full-auto" is kept
-// as a historical alias for workspace-write (the old --full-auto combo) so
-// users familiar with codex's deprecated flag have a recognizable name.
+// --permissions values map directly to codex's supported --sandbox values.
 const PERMISSIONS = {
   'read-only':           { sandbox: 'read-only' },
   'workspace-write':     { sandbox: 'workspace-write' },
-  'full-auto':           { sandbox: 'workspace-write' },  // alias
   'danger-full-access':  { sandbox: 'danger-full-access' },
 };
 const DEFAULT_PERMISSIONS = 'read-only';
@@ -82,6 +82,8 @@ function parseArgs(argv) {
   let out = '';
   let debug = false;
   let quiet = false;
+  let streamThinking = false;
+  let trackReferences = false;
   let model = DEFAULT_MODEL;
   let permissions = DEFAULT_PERMISSIONS;
   let profile = '';
@@ -95,6 +97,8 @@ function parseArgs(argv) {
     else if (arg === '--out') { out = next ?? ''; i++; }
     else if (arg === '--debug') { debug = true; }
     else if (arg === '--quiet') { quiet = true; }
+    else if (arg === '--stream-thinking') { streamThinking = true; }
+    else if (arg === '--track-references') { trackReferences = true; }
     else if (arg === '--model') { model = next ?? ''; i++; }
     else if (arg === '--permissions') { permissions = (next ?? '').toLowerCase(); i++; }
     else if (arg === '--profile') { profile = next ?? ''; i++; }
@@ -112,7 +116,7 @@ function parseArgs(argv) {
     usageErr(`--permissions must be one of: ${allowed} (got "${permissions}")`);
   }
 
-  return { prompt, cwd, out, debug, quiet, model, permissions, profile };
+  return { prompt, cwd, out, debug, quiet, streamThinking, trackReferences, model, permissions, profile };
 }
 
 function usageErr(msg) {
@@ -142,6 +146,7 @@ function printUsage(stream = process.stderr) {
     `Usage:
   node codex-task.mjs (--prompt "<text>" | --prompt-file <path>)
                       [--cwd DIR] [--out FILE] [--debug] [--quiet]
+                      [--stream-thinking] [--track-references]
                       [--model MODEL] [--permissions ${perms}]
                       [--profile NAME]
 
@@ -157,7 +162,7 @@ Required:
 Workspace:
   --cwd          Working directory codex operates inside (relative to caller
                  cwd, or absolute). Default: caller cwd. Codex's sandbox is
-                 bounded by this directory plus the wrapper's scratch dir.
+                 bounded by this directory unless danger-full-access is used.
 
 Codex pass-throughs:
   --model        Model codex should use. Default: ${DEFAULT_MODEL}.
@@ -176,9 +181,6 @@ Codex pass-throughs:
                                       working directory (--cwd). Files
                                       outside the workdir remain read-only.
                                       Use for refactors and edits.
-                   full-auto          alias for workspace-write (matches
-                                      the historical 'codex --full-auto'
-                                      shorthand).
                    danger-full-access codex can read AND write anywhere
                                       on the filesystem. Use only when you
                                       explicitly need cross-tree writes
@@ -196,18 +198,24 @@ Wrapper options:
                  printed to stdout). Useful for piping or persisting.
   --debug        Keep the per-session scratch dir on success. Default
                  cleans it up. Failures always preserve it regardless.
-  --quiet        Discard codex's live log output instead of streaming it
-                 to stderr. By default codex chatter prints to stderr so
-                 callers can follow progress; structured stdout (JSON) is
-                 unaffected.
+  --quiet        Suppress live mirroring to stderr. Retained for
+                 compatibility; live streaming is already disabled by default.
+  --stream-thinking
+                 Mirror codex's live stdout/stderr to this wrapper's stderr.
+                 By default, codex chatter is captured only for diagnostic
+                 tails and is not streamed.
+  --track-references
+                 Include "referenced" entries in the files map. By default,
+                 referenced-only files are omitted so the JSON stays small.
 
 Output: JSON on stdout. Shape:
 
   {
     "ok": true,
+    "taskResult": "completed",
     "summary":     "<one or two sentences>",
     "details":     "<markdown>",
-    "files":       { "<path>": "<created|deleted|edited|referenced>", ... },
+    "files":       { "<path>": "<created|deleted|edited>", ... },
     "workdir":     "<absolute --cwd>",
     "sessionDir":  null,
     "model":       "<model used>",
@@ -231,7 +239,7 @@ session history — each task is a clean slate.
 
 // ---------- prompt synthesis ----------
 
-function buildPrompt(userPrompt, permissions) {
+function buildPrompt(userPrompt, { permissions, trackReferences }) {
   const readOnly = permissions === 'read-only';
   const lines = [
     `You are being invoked through a wrapper that captures a structured result.`,
@@ -246,8 +254,8 @@ function buildPrompt(userPrompt, permissions) {
       `file under the working directory, but you CANNOT modify, create, or`,
       `delete files there. If the task asks you to modify files, instead`,
       `describe in 'details' exactly what edits would be needed (with file`,
-      `paths and snippets). Use the 'files' map with action "referenced" for`,
-      `every file you read.`,
+      `paths and snippets). Set "taskResult" to "blocked" when a requested`,
+      `write/create/delete could not be completed because of the sandbox.`,
       ``,
     );
   }
@@ -257,6 +265,7 @@ function buildPrompt(userPrompt, permissions) {
     `fences, no commentary:`,
     ``,
     `{`,
+    `  "taskResult": "<completed|partial|blocked|failed>",`,
     `  "summary": "<one or two sentence high-level description of what you did>",`,
     `  "details": "<longer markdown explanation including reasoning, caveats, and any follow-ups the caller should know about>",`,
     `  "files": {`,
@@ -270,13 +279,20 @@ function buildPrompt(userPrompt, permissions) {
     `  - "edited"      — file existed before; you modified its contents`,
     `  - "referenced"  — you read the file as context but did not change it`,
     ``,
-    `Include EVERY file you read, modified, created, or deleted — including ones`,
-    `you only inspected for context. Use repo-relative paths where possible (the`,
-    `working directory above is the project root). Files outside the working`,
-    `directory may use absolute paths.`,
+    `Set "taskResult" to:`,
+    `  - "completed"  — the requested task outcome was fully achieved`,
+    `  - "partial"    — some requested outcomes were achieved, but not all`,
+    `  - "blocked"    — sandbox, auth, missing dependency, or another external`,
+    `                   constraint prevented the requested outcome`,
+    `  - "failed"     — you could not complete the requested outcome for any`,
+    `                   other reason`,
     ``,
-    `If the task is purely informational (no files touched), use an empty object`,
-    `for "files".`,
+    trackReferences
+      ? `Include EVERY file you read, modified, created, or deleted — including files you only inspected for context.`
+      : `In "files", include only files you created, edited, or deleted. Do NOT include files you only read for context.`,
+    `Use repo-relative paths where possible. Files outside the working directory may use absolute paths.`,
+    ``,
+    `If no files should be reported under that rule, use an empty object for "files".`,
     ``,
     `Your final message is the ONLY thing the wrapper sees — make sure it is`,
     `just the JSON object above, nothing else.`,
@@ -313,33 +329,105 @@ function buildSpawnArgs({ workdir, lastMessagePath, model, permissions, profile 
   return args;
 }
 
-function runCodex({ prompt, env, args, quiet }) {
+function spawnCodex(args, options = {}) {
+  const isWin = process.platform === 'win32';
+  return spawn('codex', args, {
+    ...options,
+    shell: isWin,
+  });
+}
+
+function checkCodexAvailable(env) {
+  return new Promise((resolveP) => {
+    const child = spawnCodex(['--version'], {
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (d) => { stdout += d.toString(); });
+    child.stderr?.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', (e) => {
+      resolveP({
+        ok: false,
+        error: formatCodexUnavailable(e, ''),
+      });
+    });
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolveP({ ok: true, version: stdout.trim() || stderr.trim() });
+        return;
+      }
+      resolveP({
+        ok: false,
+        error: formatCodexUnavailable(null, stderr || stdout),
+      });
+    });
+  });
+}
+
+function formatCodexUnavailable(error, output) {
+  const detail = output.trim() || error?.message || 'no diagnostic output';
+  const missing = error?.code === 'ENOENT'
+    || /not recognized|not found|command not found|could not find/i.test(detail);
+  if (missing) {
+    return `codex CLI was not found on PATH. Install OpenAI Codex, run "codex login", then retry. Diagnostic: ${detail}`;
+  }
+  return `failed to run "codex --version". Verify OpenAI Codex is installed and runnable, then retry. Diagnostic: ${detail}`;
+}
+
+function runCodex({ prompt, env, args, streamThinking }) {
   return new Promise((resolveP, rejectP) => {
     // On Windows codex is a .cmd shim — post-CVE-2024-27980 Node refuses to
     // spawn .cmd without shell:true (EINVAL). shell:true emits DEP0190 (we
     // suppress it; args here are static flags + paths with no shell metachars).
     // Prompt itself is piped via stdin to dodge shell-arg-concat splitting.
-    const isWin = process.platform === 'win32';
-    const child = spawn('codex', args, {
+    const child = spawnCodex(args, {
       env,
-      stdio: ['pipe', quiet ? 'ignore' : 'inherit', quiet ? 'pipe' : 'inherit'],
-      shell: isWin,
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
-    // When stderr is 'pipe' (quiet mode) we still want a tail for error
-    // reporting. When 'inherit', codex's diagnostics flow to the user's
-    // terminal and we have no captured tail.
+    let stdoutTail = '';
     let stderrTail = '';
-    if (quiet && child.stderr) {
-      child.stderr.on('data', (d) => {
-        stderrTail += d.toString();
-        if (stderrTail.length > 4000) stderrTail = stderrTail.slice(-4000);
-      });
-    }
+    child.stdout?.on('data', (d) => {
+      const text = d.toString();
+      stdoutTail += text;
+      if (stdoutTail.length > 4000) stdoutTail = stdoutTail.slice(-4000);
+      if (streamThinking) process.stderr.write(text);
+    });
+    child.stderr?.on('data', (d) => {
+      const text = d.toString();
+      stderrTail += text;
+      if (stderrTail.length > 4000) stderrTail = stderrTail.slice(-4000);
+      if (streamThinking) process.stderr.write(text);
+    });
     child.on('error', rejectP);
-    child.on('close', (code) => resolveP({ code: code ?? -1, stderrTail }));
+    child.on('close', (code) => resolveP({ code: code ?? -1, stdoutTail, stderrTail }));
     child.stdin.write(prompt);
     child.stdin.end();
   });
+}
+
+function formatCodexRunFailure(runResult) {
+  const tail = (runResult.stderrTail || runResult.stdoutTail || '').trim();
+  const detail = tail || 'codex produced no diagnostic output';
+  const hint = codexFailureHint(detail);
+  return `codex exited with code ${runResult.code}. ${hint}Diagnostic tail: ${detail}`;
+}
+
+function codexFailureHint(detail) {
+  if (/missing bearer|authentication|unauthorized|401|login/i.test(detail)) {
+    return 'Codex appears to be unauthenticated or the login expired; run "codex login" and retry. ';
+  }
+  if (/quota|rate limit|usage limit|limit exceeded/i.test(detail)) {
+    return 'Codex appears to have hit a quota or rate limit; wait for quota reset or use a different plan/model. ';
+  }
+  if (/not supported.*ChatGPT account|model .*not supported|400/i.test(detail)) {
+    return 'The selected model may not be available for this ChatGPT account; retry without --model or choose a supported model. ';
+  }
+  if (/sandbox|permission denied|operation not permitted|patch rejected|read-only/i.test(detail)) {
+    return 'Codex hit a filesystem or sandbox restriction; check --permissions and the target path. ';
+  }
+  return '';
 }
 
 function readResult(lastMessagePath) {
@@ -413,11 +501,23 @@ function extractFirstJsonObject(s) {
   return null;
 }
 
-function normalizeResult(parsed) {
+function normalizeResult(parsed, { trackReferences }) {
   const warnings = [];
+  let taskResult = parsed.taskResult;
   let summary = parsed.summary;
   let details = parsed.details;
   let files = parsed.files;
+
+  if (typeof taskResult !== 'string') {
+    warnings.push(`result.taskResult missing or not a string; got ${typeOf(taskResult)}`);
+    taskResult = 'failed';
+  } else {
+    taskResult = taskResult.toLowerCase().trim();
+    if (!ALLOWED_TASK_RESULTS.has(taskResult)) {
+      warnings.push(`result.taskResult has unknown value "${parsed.taskResult}"; recording as "failed"`);
+      taskResult = 'failed';
+    }
+  }
 
   if (typeof summary !== 'string') {
     warnings.push(`result.summary missing or not a string; got ${typeOf(summary)}`);
@@ -436,19 +536,19 @@ function normalizeResult(parsed) {
   for (const [path, rawAction] of Object.entries(files)) {
     if (typeof rawAction !== 'string') {
       warnings.push(`files["${path}"] action is not a string (got ${typeOf(rawAction)}); recording as "referenced"`);
-      normalizedFiles[path] = 'referenced';
+      if (trackReferences) normalizedFiles[path] = 'referenced';
       continue;
     }
     const action = rawAction.toLowerCase().trim();
     if (ALLOWED_ACTIONS.has(action)) {
-      normalizedFiles[path] = action;
+      if (action !== 'referenced' || trackReferences) normalizedFiles[path] = action;
     } else {
       warnings.push(`files["${path}"] has unknown action "${rawAction}"; recording as "referenced"`);
-      normalizedFiles[path] = 'referenced';
+      if (trackReferences) normalizedFiles[path] = 'referenced';
     }
   }
 
-  return { summary, details, files: normalizedFiles, warnings };
+  return { taskResult, summary, details, files: normalizedFiles, warnings };
 }
 
 function typeOf(v) {
@@ -485,11 +585,28 @@ async function main() {
     return emit({
       ok: false,
       error: `--cwd ${args.cwd || workdir} does not exist`,
+      taskResult: 'failed',
       summary: '', details: '', files: {},
       workdir, sessionDir: null,
       model: args.model, permissions: args.permissions,
       warnings, durationMs: Date.now() - start,
     }, 2, args.out);
+  }
+
+  const env = { ...process.env };
+  delete env.OPENAI_API_KEY;
+
+  const codexCheck = await checkCodexAvailable(env);
+  if (!codexCheck.ok) {
+    return emit({
+      ok: false,
+      error: codexCheck.error,
+      taskResult: 'failed',
+      summary: '', details: '', files: {},
+      workdir, sessionDir: null,
+      model: args.model, permissions: args.permissions,
+      warnings, durationMs: Date.now() - start,
+    }, 1, args.out);
   }
 
   // Per-session scratch dir lives in the OS temp area, NOT inside the workdir.
@@ -505,6 +622,7 @@ async function main() {
     return emit({
       ok: false,
       error: `failed to create session dir ${sessionDir}: ${e.message}`,
+      taskResult: 'failed',
       summary: '', details: '', files: {},
       workdir, sessionDir,
       model: args.model, permissions: args.permissions,
@@ -512,7 +630,10 @@ async function main() {
     }, 1, args.out);
   }
 
-  const prompt = buildPrompt(args.prompt, args.permissions);
+  const prompt = buildPrompt(args.prompt, {
+    permissions: args.permissions,
+    trackReferences: args.trackReferences,
+  });
   const spawnArgs = buildSpawnArgs({
     workdir,
     lastMessagePath,
@@ -522,16 +643,19 @@ async function main() {
     profile: args.profile,
   });
 
-  const env = { ...process.env };
-  delete env.OPENAI_API_KEY;
-
   let runResult;
   try {
-    runResult = await runCodex({ prompt, env, args: spawnArgs, quiet: args.quiet });
+    runResult = await runCodex({
+      prompt,
+      env,
+      args: spawnArgs,
+      streamThinking: args.streamThinking && !args.quiet,
+    });
   } catch (e) {
     return emit({
       ok: false,
       error: `failed to spawn codex: ${e.message}`,
+      taskResult: 'failed',
       summary: '', details: '', files: {},
       workdir, sessionDir,
       model: args.model, permissions: args.permissions,
@@ -540,10 +664,10 @@ async function main() {
   }
 
   if (runResult.code !== 0) {
-    const tail = args.quiet ? runResult.stderrTail.slice(-500).trim() : '(streamed to terminal)';
     return emit({
       ok: false,
-      error: `codex exited with code ${runResult.code}. stderr tail: ${tail}`,
+      error: formatCodexRunFailure(runResult),
+      taskResult: 'failed',
       summary: '', details: '', files: {},
       workdir, sessionDir,
       model: args.model, permissions: args.permissions,
@@ -557,6 +681,7 @@ async function main() {
     return emit({
       ok: false,
       error: read.error,
+      taskResult: 'failed',
       summary: '', details: '', files: {},
       workdir, sessionDir,
       model: args.model, permissions: args.permissions,
@@ -565,7 +690,7 @@ async function main() {
   }
   if (read.warning) warnings.push(read.warning);
 
-  const norm = normalizeResult(read.value);
+  const norm = normalizeResult(read.value, { trackReferences: args.trackReferences });
   warnings.push(...norm.warnings);
 
   let cleanedUp = false;
@@ -578,8 +703,10 @@ async function main() {
     }
   }
 
+  const ok = norm.taskResult === 'completed';
   emit({
-    ok: true,
+    ok,
+    taskResult: norm.taskResult,
     summary: norm.summary,
     details: norm.details,
     files: norm.files,
@@ -589,7 +716,7 @@ async function main() {
     permissions: args.permissions,
     warnings,
     durationMs: Date.now() - start,
-  }, 0, args.out);
+  }, ok ? 0 : 1, args.out);
 }
 
 main().catch((e) => {

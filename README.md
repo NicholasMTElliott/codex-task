@@ -9,13 +9,13 @@ Single mode: feed it a `--prompt` (or `--prompt-file`), it runs `codex exec` aga
 ```json
 {
   "ok": true,
+  "taskResult": "completed",
   "summary": "Renamed getCwd to getCurrentWorkingDirectory across 8 files; updated 3 tests.",
   "details": "Searched the repo for all occurrences of `getCwd` (15 hits). Renamed the function and call sites, updated import names, and adjusted the 3 tests that asserted on the old name. One TODO comment in `src/legacy.js` references the old name; left as-is since it's purely informational.",
   "files": {
     "src/utils/paths.js": "edited",
     "src/server/routes.js": "edited",
-    "tests/paths.test.js": "edited",
-    "src/legacy.js": "referenced"
+    "tests/paths.test.js": "edited"
   },
   "workdir":     "/abs/path/to/project",
   "sessionDir":  null,
@@ -26,9 +26,9 @@ Single mode: feed it a `--prompt` (or `--prompt-file`), it runs `codex exec` aga
 }
 ```
 
-Action values for each touched file are one of `created`, `deleted`, `edited`, or `referenced`. The parent agent (Claude Code etc.) can use this to audit what changed without reading codex's full transcript.
+Action values are `created`, `deleted`, or `edited` by default. Pass `--track-references` to include `referenced` files too. The parent agent (Claude Code etc.) can audit changes without reading codex's full transcript.
 
-**Default permissions are `read-only`** — codex can read your project but cannot modify any files. Pair with `--permissions workspace-write` (or `full-auto`) when you want codex to actually edit. `read-only` is the right default for the bulk of delegated work: investigations, audits, codebase questions, multi-file analysis.
+**Default permissions are `read-only`** — codex can read your project but cannot modify any files. Pair with `--permissions workspace-write` when you want codex to actually edit. `read-only` is the right default for the bulk of delegated work: investigations, audits, codebase questions, multi-file analysis.
 
 Ships with an Anthropic-style `SKILL.md` that the installer registers with each detected coding-agent harness (Claude Code, opencode, Cline, Cursor, …) so the agent knows when and how to invoke it.
 
@@ -43,6 +43,7 @@ When you're running on a Claude (or other paid) subscription and want to delegat
 | `codex-task.mjs` | The tool. Plain Node ESM, no npm dependencies. |
 | `install.mjs` | Cross-platform installer. Copies the tool to `~/.codex-task/` and registers the skill with each supported harness (Claude Code, opencode, Cline, Cursor). |
 | `SKILL.md` | Skill template (Anthropic frontmatter — `name` + `description` + `allowed-tools`). The installer fills in the resolved install path and drops the same rendered file into every target's user-global skills dir. |
+| `scripts/permission-matrix.mjs` | Manual Codex sandbox matrix. Not part of `npm test`; run it explicitly when validating permission behavior against a local project. |
 | `memory-bank/` | LLM-optimized project context (projectBrief, productContext, systemPatterns, techContext). |
 | `tests/` | Node test smoke coverage for the CLI help and installer target listing. |
 | `package.json` | Open-source package metadata, scripts, engine, and optional `codex-task` bin entry. |
@@ -139,7 +140,7 @@ node "$env:USERPROFILE\.codex-task\codex-task.mjs" `
   --prompt "Find every place in this repo that imports lodash.merge and list options for replacing each one."
 ```
 
-Output is JSON on stdout. Codex's own progress chatter streams live to stderr by default so you can follow what it's doing; pass `--quiet` to suppress that stream. The per-session scratch dir lives under your OS temp directory (not inside the project), is removed automatically on success, and is preserved on failure — `sessionDir` in the JSON output points at it.
+Output is JSON on stdout. Codex's own progress chatter is captured silently by default; pass `--stream-thinking` to mirror it live to stderr. The per-session scratch dir lives under your OS temp directory (not inside the project), is removed automatically on success, and is preserved on failure — `sessionDir` in the JSON output points at it.
 
 ### Parameters
 
@@ -158,26 +159,30 @@ Output is JSON on stdout. Codex's own progress chatter streams live to stderr by
 - `--permissions` (optional, default `read-only`). Sandbox policy for codex. Maps to codex's `--sandbox`:
   - `read-only` (default) — codex can read but not modify any file in the workspace.
   - `workspace-write` — codex can read AND write inside `--cwd`. Files outside the workdir remain read-only.
-  - `full-auto` — alias for `workspace-write` (matches the historical `codex --full-auto` shorthand).
   - `danger-full-access` — codex can read AND write anywhere on the filesystem.
 
   The structured result is captured via codex's `--output-last-message` flag (a codex-process write, not a model write), so it works under any sandbox mode including `read-only`.
 - `--profile` (optional). Codex config profile name. If set, codex loads option defaults from this profile in `~/.codex/config.toml`.
 
+There is no wrapper `--search` flag. If the delegated task needs current web information, say so in the prompt, e.g. `--prompt "Search the web for the latest Codex release, then update docs/version.md."` Codex can perform web search from `codex exec` when explicitly instructed.
+
 #### Wrapper options
 
 - `--out` (optional). Also write the result JSON to this file path (still printed to stdout).
 - `--debug` (optional flag). Keep the per-session scratch dir on success. Default cleans it up. Failed runs always preserve scratch regardless.
-- `--quiet` (optional flag). Discard codex's live log output instead of streaming it to stderr.
+- `--stream-thinking` (optional flag). Mirror Codex live stdout/stderr to wrapper stderr. Default is silent capture only.
+- `--track-references` (optional flag). Include `referenced` entries in `files`. Default omits referenced-only files.
+- `--quiet` (optional flag). Compatibility flag; live thinking is already off by default, and `--quiet` suppresses streaming even when combined with `--stream-thinking`.
 
 ### Output JSON shape
 
 ```json
 {
   "ok": true,
+  "taskResult": "completed",
   "summary":     "<one or two sentences>",
   "details":     "<markdown>",
-  "files":       { "<path>": "created|deleted|edited|referenced", ... },
+  "files":       { "<path>": "created|deleted|edited", ... },
   "workdir":     "<absolute --cwd>",
   "sessionDir":  null,
   "model":       "<model used>",
@@ -187,16 +192,23 @@ Output is JSON on stdout. Codex's own progress chatter streams live to stderr by
 }
 ```
 
-`ok` is `true` only when codex exits cleanly AND its final message parses as a JSON object with a non-null root. On `false`, an additional `error` field is populated, and `sessionDir` is preserved so you can inspect codex's interim output.
+`ok` is `true` only when codex exits cleanly, its final message parses, and `taskResult` is `completed`. On `false`, inspect `taskResult`, `error`, `details`, and `warnings`; `sessionDir` is preserved for wrapper/runtime failures.
+
+`taskResult` values:
+
+- `completed` — requested outcome was fully achieved.
+- `partial` — some requested outcomes were achieved, but not all.
+- `blocked` — sandbox, auth, dependency, or another external constraint prevented the requested outcome.
+- `failed` — Codex could not complete the requested outcome for another reason.
 
 `files` action values are one of:
 
 - `created` — file did not exist before; codex created it.
 - `deleted` — file existed before; codex removed it.
 - `edited` — file existed before; codex modified its contents.
-- `referenced` — codex read the file as context but did not change it.
+- `referenced` — codex read the file as context but did not change it. Only present when `--track-references` is passed.
 
-If codex returns an unknown action verb (`"modified"`, `"updated"`, etc.), the wrapper coerces it to `"referenced"` and emits a warning rather than failing the run.
+If codex returns an unknown action verb (`"modified"`, `"updated"`, etc.), the wrapper coerces it to `"referenced"` and emits a warning rather than failing the run. Referenced entries are omitted unless `--track-references` is set.
 
 Inspect `warnings` for non-fatal anomalies: unknown action verbs, missing schema fields, cleanup failures.
 
@@ -208,7 +220,7 @@ Example dialogue (Claude Code):
 
 > **You:** I want to rename `getCwd` to `getCurrentWorkingDirectory` everywhere it appears in this repo, including tests. Use codex-task — I'd rather not burn this conversation on it.
 >
-> **Claude:** *(invokes `node ~/.codex-task/codex-task.mjs --permissions workspace-write --prompt "Rename getCwd to getCurrentWorkingDirectory across this repo. Update every call site, every import, every test. Do not change anything else."`, waits ~60s while codex's progress streams to the terminal, then reads the JSON and surfaces the `summary` + `files` to you)*
+> **Claude:** *(invokes `node ~/.codex-task/codex-task.mjs --permissions workspace-write --prompt "Rename getCwd to getCurrentWorkingDirectory across this repo. Update every call site, every import, every test. Do not change anything else."`, waits ~60s, then reads the JSON and validates `ok`, `taskResult`, `summary`, and `files`)*
 
 The same rendered `SKILL.md` is dropped into every target harness's skills dir, so the experience is identical from Claude Code, opencode, Cline, Cursor, or any other harness that reads Anthropic-style skill frontmatter (`name` + `description`). Harnesses that don't recognize the `allowed-tools` field simply ignore it.
 
@@ -247,11 +259,39 @@ The installer is idempotent: re-running overwrites the installed copy in `~/.cod
 
 6. **Worried about accidental API billing** — the wrapper strips `OPENAI_API_KEY` from the spawned env before invoking codex, so subscription routing is locked in regardless of what your shell has set.
 
+7. **`codex` is not installed** — the wrapper checks `codex --version` before spending a run. If the binary is missing or not runnable, the JSON error tells you to install Codex and run `codex login`.
+
+8. **Not logged in** — if `codex exec` returns an auth-shaped failure (`401`, missing bearer token, expired login), the JSON error includes the diagnostic tail and tells you to run `codex login`.
+
 ## Cost & timing
 
 - Time scales with task scope. Trivial codebase questions: ~15-30s. Multi-file refactors: 1-5 minutes. Long investigations: 5+ minutes.
 - Quota: text-only tasks burn ChatGPT subscription quota at the normal text rate (5-hour rolling cap + weekly cap). Plan accordingly for batch use.
 - The wrapper is serial-by-design. Do not invoke it in parallel — codex's session-state handling corrupts under concurrent `CODEX_HOME` use.
+
+## Manual permission matrix
+
+The repo includes a manual harness for validating Codex sandbox behavior against a real local project. It is not run by `npm test` because it spends Codex quota and includes a `danger-full-access` case.
+
+```powershell
+node scripts/permission-matrix.mjs --yes --target ..\kva
+```
+
+Matrix:
+
+| Permission | Read features | Write `FEATURES.<run>.md` in workspace | Write `FEATURES.<run>.md` to parent dir |
+|------------|---------------|-----------------------------------------|------------------------------------------|
+| `read-only` | should work | should fail | should fail |
+| `workspace-write` | should work | should work | should fail |
+| `danger-full-access` | should work | should work | should work |
+
+Useful options:
+
+- `--permission read-only` — run one permission row.
+- `--task write-workspace-features` — run one task column.
+- `--model <name>` — pass a model through to codex-task.
+- `--stream-thinking` — ask codex-task to mirror live Codex chatter to stderr.
+- `--keep-files` — keep successful probe files for inspection.
 
 ## Design notes
 
@@ -264,8 +304,11 @@ The installer is idempotent: re-running overwrites the installed copy in `~/.cod
 - **Why the scratch dir lives in OS temp, not in the workdir**: keeps the user's project clean of wrapper artifacts (no `.codex-task-tmp/` to add to `.gitignore`). Codex itself writes the agent's final message into the scratch dir via `--output-last-message`, which is a wrapper-process write and is unaffected by `--sandbox` — so `read-only` works end-to-end without needing any write-access concessions in the model sandbox.
 - **Why `--cd` to the user's workdir, not a sandbox**: unlike `codex-image-gen` (which sandboxes codex in a fresh tmp dir for image generation), `codex-task` deliberately points codex at the user's project. The whole point is to perform work on the user's files. The blast radius is bounded by codex's `--sandbox` policy, which is in turn confined to `--cd`; the scratch dir is written by the codex CLI process only through `--output-last-message`.
 - **Why `--ephemeral` by default**: this is a one-shot delegated task, not part of a persisted interactive session. We don't want every codex-task invocation cluttering codex's session history.
-- **Why `--output-last-message` instead of parsing stdout**: codex's `exec` stdout is verbose — reasoning traces, tool-call chatter, partial outputs — and meant for humans. `--output-last-message` tells codex's CLI process to write *just* the agent's final message text to a file after the run, no interleaving. We tell the model in the prompt that its final message must be a single JSON object, and parse the file we get back. As a bonus, this leaves stdout free for live progress streaming.
-- **Why coerce unknown action verbs to `referenced`**: codex occasionally returns synonyms like `"modified"` or `"updated"`. Rejecting the whole run for a synonym would be hostile to callers; the wrapper rewrites and warns instead. The schema's `files` map is always one of the four canonical verbs.
+- **Why `--output-last-message` instead of parsing stdout**: codex's `exec` stdout is verbose — reasoning traces, tool-call chatter, partial outputs — and meant for humans. `--output-last-message` tells codex's CLI process to write *just* the agent's final message text to a file after the run, no interleaving. We tell the model in the prompt that its final message must be a single JSON object, and parse the file we get back.
+- **Why no `--search` flag**: Codex can search the web when the prompt explicitly asks for it. The wrapper does not expose a separate search switch because there is nothing special to map; include web-research instructions in the task prompt.
+- **Why thinking is opt-in**: parent agents should spend context on the final contract, not another agent's transcript. By default, Codex chatter is captured only for bounded diagnostic tails. `--stream-thinking` mirrors it to stderr when a human wants to watch.
+- **Why references are opt-in**: for most delegated edits, changed files matter more than every file Codex inspected. By default, `files` omits `referenced` entries. `--track-references` restores the larger audit map.
+- **Why coerce unknown action verbs to `referenced`**: codex occasionally returns synonyms like `"modified"` or `"updated"`. Rejecting the whole run for a synonym would be hostile to callers; the wrapper rewrites and warns instead. Referenced entries are omitted unless `--track-references` is set.
 
 ## Compatibility notes
 
