@@ -1,7 +1,7 @@
 # projectBrief
 
 ## Purpose
-Portable Node CLI tool that lets Claude Code, opencode, Cline, Cursor, or any other coding-agent harness delegate a self-contained coding task to OpenAI's `codex` CLI and receive a structured JSON result describing what was done. Routes billing through the user's ChatGPT subscription instead of API tokens. Companion to `codex-image-gen` (same install/distribution patterns, different runtime payload).
+Portable Node CLI tool that lets Claude Code, opencode, Cline, Cursor, or any other coding-agent harness delegate a self-contained writing, summarization, investigation, or explicitly requested implementation task to OpenAI's `codex` CLI and receive a structured JSON result describing what was done. Routes billing through the user's ChatGPT subscription instead of API tokens. Primary skill use is proactive technical/creative writing: documentation drafts, README/release notes/changelogs, codebase feature summaries, narrative cleanup, and prose-heavy analysis. Coding/code execution is supported but should generally be delegated only when specifically requested or clearly required by the brief. Companion to `codex-image-gen` (same install/distribution patterns, different runtime payload).
 
 ## Scope
 - One ESM entry point: `codex-task.mjs`.

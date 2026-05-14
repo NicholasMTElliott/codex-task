@@ -1,7 +1,7 @@
 # productContext
 
 ## Problem
-A "parent" coding agent (Claude Code, opencode, etc.) running on a Claude subscription often wants to delegate a self-contained chunk of work — a refactor, a scaffolding pass, an exploratory question — to a fresh agent context without spending its own conversation budget on it. Calling OpenAI's API directly for this burns API tokens. Many users have a ChatGPT Plus/Pro subscription whose quota would otherwise go unused.
+A "parent" coding agent (Claude Code, opencode, etc.) running on a Claude subscription often wants to delegate a self-contained chunk of work — documentation writing, summary generation, prose cleanup, exploratory questions, and occasionally explicit implementation work — to a fresh agent context without spending its own conversation budget on it. Calling OpenAI's API directly for this burns API tokens. Many users have a ChatGPT Plus/Pro subscription whose quota would otherwise go unused.
 
 ## Solution
 Wrap `codex exec` so a parent agent can hand a free-form prompt to codex, let codex execute against the current project, and receive back a structured JSON result with:
@@ -56,6 +56,7 @@ On failure: `ok: false`, an `error` field with a stderr tail or parse-failure me
 - The wrapper takes whatever the underlying codex run takes, typically 15s for trivial codebase questions, 1-5 minutes for multi-file refactors, longer for exploratory investigation. There is no progress signal by default; pass `--stream-thinking` for live Codex chatter on stderr.
 - The scratch dir lives outside the user's project (under OS tmp), so the workdir is never polluted with a wrapper-owned folder. Nothing to add to `.gitignore`.
 - The structured JSON is the canonical handoff. `ok` + `taskResult` determine whether the delegated outcome succeeded. The `summary` field is the one to surface to the human user; `details` is for the parent agent to read; `files` is for changed-file audit by default.
+- The skill should be leaned on proactively for technical/creative writing, documentation drafts, feature summaries, changelog/release-note prose, README improvements, and narrative cleanup. Coding and code execution are valid but secondary: delegate them when specifically requested or when the task brief clearly asks Codex to implement.
 - Codex runs non-interactively; `codex exec` defaults approval to `never`, so there are no clarifying questions or per-command prompts. The parent agent must specify the task fully up-front.
 - The `read-only` default permission means the wrapper is safe to invoke for investigations without worry about codex modifying the workspace. Refactors and edits require opting in via `--permissions workspace-write`. Cross-tree writes require `--permissions danger-full-access`. The wrapper documents this trade-off heavily in the prompt under `read-only` so codex describes intended edits in `details` rather than failing when its writes are blocked.
 - Failures (`ok: false`) preserve the scratch dir regardless of `--debug`; users can inspect codex's interim output without re-running.

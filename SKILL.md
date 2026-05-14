@@ -1,33 +1,37 @@
 ---
 name: codex-task
-description: Delegate a self-contained coding task to a second agent (OpenAI's codex CLI) and get back structured JSON with taskResult, summary, details, and changed files. Routes billing through the user's ChatGPT subscription, NOT API tokens. Default permissions are `read-only` (codex cannot modify the user's files) — perfect for investigations, audits, and codebase questions. Pass `--permissions workspace-write` when you actually want codex to edit files. Use for medium-sized tasks you want offloaded to a fresh context — refactors, multi-file edits, codebase questions, scaffolding, exploratory investigation, and explicitly requested web research — where the parent agent wants a concise, machine-readable summary instead of a verbose transcript. Do NOT use for trivial one-line edits (just do them yourself), tasks that require live back-and-forth with the user, or tasks that need credentials/services codex doesn't have.
+description: Delegate a self-contained technical or creative writing task to OpenAI's codex CLI and get back structured JSON with taskResult, summary, details, and changed files. Routes billing through the user's ChatGPT subscription, NOT API tokens. Lean on this proactively for documentation writing, README/release-note/changelog drafts, technical summaries, codebase feature summaries, narrative cleanup, and other prose-heavy work that benefits from a fresh context. Default permissions are `read-only` (codex cannot modify the user's files), which is ideal for summaries, audits, documentation plans, and prose drafts returned in JSON. Pass `--permissions workspace-write` when the task should write docs or other files. It can also be used for coding, code execution, refactors, or scaffolding, but generally only when the user specifically requests delegated coding work or the prompt clearly calls for Codex to make code changes. Do NOT use for trivial edits, tasks that require live back-and-forth with the user, or tasks that need credentials/services codex doesn't have.
 allowed-tools:
   - Bash(node <<SCRIPT_PATH>> *)
 ---
 
 # codex-task
 
-Shells out to the user's locally-installed `codex` CLI to perform an arbitrary agent task against the current project, and returns a structured JSON result. Billing flows through the user's ChatGPT subscription (no API tokens). Useful when you want to hand a self-contained chunk of work to a fresh agent context and get back a concise machine-readable result.
+Shells out to the user's locally-installed `codex` CLI to perform an arbitrary agent task against the current project, and returns a structured JSON result. Billing flows through the user's ChatGPT subscription (no API tokens). Useful when you want to hand a self-contained writing, summarization, investigation, or explicitly requested implementation task to a fresh agent context and get back a concise machine-readable result.
 
 **Default permissions are `read-only`** — codex can read the workspace but cannot modify any files. This is the right default for investigations, audits, and codebase questions. Pass `--permissions workspace-write` when you want codex to actually edit files. Pass `--permissions danger-full-access` only when you explicitly need cross-tree writes outside the working directory.
 
 ## When to use
 
-- Multi-file refactors with a clear brief ("rename `getCwd` → `getCurrentWorkingDirectory` across the repo and update tests") — pair with `--permissions workspace-write`.
-- Scaffolding ("add a new express route at /health that returns process uptime and write a test") — pair with `--permissions workspace-write`.
+- Documentation writing and revision ("draft a README quickstart from this repo", "turn these notes into a migration guide", "write release notes from the last five commits"). Use `read-only` for returned prose; use `workspace-write` when Codex should edit files.
+- Summary generation ("read this project and return a bullet list of features", "summarize the architecture for a new contributor", "produce a changelog-style summary"). Default `read-only` is sufficient.
+- Technical or creative prose work ("make this design doc clearer", "generate examples for the docs", "rewrite this guide for a less expert audience"). Default `read-only` is sufficient unless writing files.
+- Documentation audits and content planning ("find stale docs", "identify missing README sections", "outline docs needed for this package"). Default `read-only` is sufficient.
 - Exploratory investigation ("find every place we still depend on the deprecated `lodash.merge` and list options for replacing them") — default `read-only` is sufficient.
 - Codebase questions you'd rather not load into your own context ("summarize the auth flow across these three services") — default `read-only` is sufficient.
+- Coding, code execution, refactors, and scaffolding only when the user explicitly asks for delegated coding work or the task brief clearly requires Codex to make implementation changes. Pair write tasks with `--permissions workspace-write`.
 - Anything where a structured `files` map is more useful to you than a chat transcript.
 
 ## When NOT to use
 
 - Trivial single-line edits — just do them yourself.
+- Routine coding tasks the parent agent can directly implement. Proactively delegate prose and summaries; delegate code only when specifically requested or clearly beneficial.
 - Tasks that need live user feedback or clarifying questions — codex runs non-interactively and won't pause to ask.
 - Tasks needing credentials or private services codex isn't already wired up for.
-
-Codex can access the web when the prompt explicitly asks it to search. No wrapper `--search` flag is needed; put the web-research instruction directly in `--prompt` / `--prompt-file`.
 - Tasks where you've already loaded the relevant context and a hand-off would waste tokens re-reading the same files.
 - Production-critical changes you wouldn't merge without a careful review — codex's `details` field is the only audit trail you get for free.
+
+Codex can access the web when the prompt explicitly asks it to search. No wrapper `--search` flag is needed; put the web-research instruction directly in `--prompt` / `--prompt-file`.
 
 ## How to invoke
 
