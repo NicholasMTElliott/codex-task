@@ -61,9 +61,13 @@ const ALLOWED_TASK_RESULTS = new Set(['completed', 'partial', 'blocked', 'failed
 // Default model. The set of supported models is plan-dependent and not
 // enumerable from the CLI — codex validates server-side and returns 400 for
 // unsupported values. Common known names at time of writing: gpt-5.5,
-// gpt-5.5-codex, gpt-5, gpt-5-codex. Surface these in --help for hints.
+// gpt-5.5-codex, gpt-5, gpt-5-codex, and the GPT-5.6 tiers (gpt-5.6-sol,
+// gpt-5.6-terra, gpt-5.6-luna). Surface these in --help for hints.
 const DEFAULT_MODEL = 'gpt-5.5';
-const KNOWN_MODEL_HINTS = ['gpt-5.5', 'gpt-5.5-codex', 'gpt-5', 'gpt-5-codex'];
+const KNOWN_MODEL_HINTS = [
+  'gpt-5.5', 'gpt-5.5-codex', 'gpt-5', 'gpt-5-codex',
+  'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna',
+];
 
 // --permissions values map directly to codex's supported --sandbox values.
 const PERMISSIONS = {
@@ -87,6 +91,7 @@ function parseArgs(argv) {
   let model = DEFAULT_MODEL;
   let permissions = DEFAULT_PERMISSIONS;
   let profile = '';
+  let reasoningEffort = null; // null = flag absent; string = resolved level
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -102,6 +107,10 @@ function parseArgs(argv) {
     else if (arg === '--model') { model = next ?? ''; i++; }
     else if (arg === '--permissions') { permissions = (next ?? '').toLowerCase(); i++; }
     else if (arg === '--profile') { profile = next ?? ''; i++; }
+    else if (arg === '--reasoning-effort') {
+      if (next === undefined || next === '') usageErr('--reasoning-effort requires a value');
+      reasoningEffort = next; i++;
+    }
     else if (arg === '-h' || arg === '--help') { printUsage(process.stdout); process.exit(0); }
     else { usageErr(`unknown argument "${arg}"`); }
   }
@@ -116,7 +125,7 @@ function parseArgs(argv) {
     usageErr(`--permissions must be one of: ${allowed} (got "${permissions}")`);
   }
 
-  return { prompt, cwd, out, debug, quiet, streamThinking, trackReferences, model, permissions, profile };
+  return { prompt, cwd, out, debug, quiet, streamThinking, trackReferences, model, permissions, profile, reasoningEffort };
 }
 
 function usageErr(msg) {
@@ -147,7 +156,8 @@ function printUsage(stream = process.stderr) {
   node codex-task.mjs (--prompt "<text>" | --prompt-file <path>)
                       [--cwd DIR] [--out FILE] [--debug] [--quiet]
                       [--stream-thinking] [--track-references]
-                      [--model MODEL] [--permissions ${perms}]
+                      [--model MODEL] [--reasoning-effort LEVEL]
+                      [--permissions ${perms}]
                       [--profile NAME]
 
 Wrap a single 'codex exec' invocation, run an arbitrary agent task, and
@@ -170,6 +180,13 @@ Codex pass-throughs:
                  server-side and returns an error for unsupported values.
                  Common known values (your plan may vary):
                    ${KNOWN_MODEL_HINTS.join(', ')}
+  --reasoning-effort
+                 Reasoning effort level, passed through to codex as
+                 -c model_reasoning_effort="<level>". Unset by default (no
+                 override). Plan- and model-dependent; codex validates
+                 server-side. Commonly-seen levels (hints only, not a
+                 validated enum): minimal|low|medium|high|xhigh, plus
+                 max|ultra on some model tiers.
   --permissions  Sandbox policy for codex. Default: ${DEFAULT_PERMISSIONS}.
                  Maps to codex's --sandbox flag (approval is always 'never'
                  since 'codex exec' defaults approval to never):
@@ -220,6 +237,7 @@ Output: JSON on stdout. Shape:
     "sessionDir":  null,
     "model":       "<model used>",
     "permissions": "<permissions mode used>",
+    "reasoningEffort": null,
     "warnings":    [],
     "durationMs":  12345
   }
@@ -302,7 +320,7 @@ function buildPrompt(userPrompt, { permissions, trackReferences }) {
 
 // ---------- runtime ----------
 
-function buildSpawnArgs({ workdir, lastMessagePath, model, permissions, profile }) {
+function buildSpawnArgs({ workdir, lastMessagePath, model, permissions, profile, reasoningEffort }) {
   // We always pass --ephemeral (this is a one-shot delegated task, not part
   // of a persisted interactive session). --sandbox is set from --permissions.
   //
@@ -325,6 +343,9 @@ function buildSpawnArgs({ workdir, lastMessagePath, model, permissions, profile 
     '--model', model,
     '--output-last-message', lastMessagePath,
   ];
+  if (reasoningEffort) {
+    args.push('-c', `model_reasoning_effort="${reasoningEffort}"`);
+  }
   if (profile) args.push('--profile', profile);
   return args;
 }
@@ -420,6 +441,9 @@ function codexFailureHint(detail) {
   }
   if (/quota|rate limit|usage limit|limit exceeded/i.test(detail)) {
     return 'Codex appears to have hit a quota or rate limit; wait for quota reset or use a different plan/model. ';
+  }
+  if (/model_reasoning_effort|reasoning[_ ]?effort/i.test(detail)) {
+    return 'The chosen --reasoning-effort may not be supported for this model/plan; drop --reasoning-effort or pick a supported level (e.g. low, medium, high). ';
   }
   if (/not supported.*ChatGPT account|model .*not supported|400/i.test(detail)) {
     return 'The selected model may not be available for this ChatGPT account; retry without --model or choose a supported model. ';
@@ -588,7 +612,7 @@ async function main() {
       taskResult: 'failed',
       summary: '', details: '', files: {},
       workdir, sessionDir: null,
-      model: args.model, permissions: args.permissions,
+      model: args.model, permissions: args.permissions, reasoningEffort: args.reasoningEffort,
       warnings, durationMs: Date.now() - start,
     }, 2, args.out);
   }
@@ -604,7 +628,7 @@ async function main() {
       taskResult: 'failed',
       summary: '', details: '', files: {},
       workdir, sessionDir: null,
-      model: args.model, permissions: args.permissions,
+      model: args.model, permissions: args.permissions, reasoningEffort: args.reasoningEffort,
       warnings, durationMs: Date.now() - start,
     }, 1, args.out);
   }
@@ -625,7 +649,7 @@ async function main() {
       taskResult: 'failed',
       summary: '', details: '', files: {},
       workdir, sessionDir,
-      model: args.model, permissions: args.permissions,
+      model: args.model, permissions: args.permissions, reasoningEffort: args.reasoningEffort,
       warnings, durationMs: Date.now() - start,
     }, 1, args.out);
   }
@@ -639,8 +663,8 @@ async function main() {
     lastMessagePath,
     model: args.model,
     permissions: args.permissions,
-    search: args.search,
     profile: args.profile,
+    reasoningEffort: args.reasoningEffort,
   });
 
   let runResult;
@@ -658,7 +682,7 @@ async function main() {
       taskResult: 'failed',
       summary: '', details: '', files: {},
       workdir, sessionDir,
-      model: args.model, permissions: args.permissions,
+      model: args.model, permissions: args.permissions, reasoningEffort: args.reasoningEffort,
       warnings, durationMs: Date.now() - start,
     }, 1, args.out);
   }
@@ -670,7 +694,7 @@ async function main() {
       taskResult: 'failed',
       summary: '', details: '', files: {},
       workdir, sessionDir,
-      model: args.model, permissions: args.permissions,
+      model: args.model, permissions: args.permissions, reasoningEffort: args.reasoningEffort,
       warnings, durationMs: Date.now() - start,
     }, 1, args.out);
   }
@@ -684,7 +708,7 @@ async function main() {
       taskResult: 'failed',
       summary: '', details: '', files: {},
       workdir, sessionDir,
-      model: args.model, permissions: args.permissions,
+      model: args.model, permissions: args.permissions, reasoningEffort: args.reasoningEffort,
       warnings, durationMs: Date.now() - start,
     }, 1, args.out);
   }
@@ -714,6 +738,7 @@ async function main() {
     sessionDir: cleanedUp ? null : sessionDir,
     model: args.model,
     permissions: args.permissions,
+    reasoningEffort: args.reasoningEffort,
     warnings,
     durationMs: Date.now() - start,
   }, ok ? 0 : 1, args.out);

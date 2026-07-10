@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +25,7 @@ test('codex-task help documents the JSON contract and permission modes', () => {
   assert.match(result.stdout, /--permissions read-only\|workspace-write\|danger-full-access/);
   assert.match(result.stdout, /--stream-thinking/);
   assert.match(result.stdout, /--track-references/);
+  assert.match(result.stdout, /--reasoning-effort/);
   assert.match(result.stdout, /Output: JSON on stdout/);
 });
 
@@ -81,6 +82,53 @@ test('codex-task can track references and opt into streaming codex output', () =
   });
 });
 
+test('codex-task rejects --reasoning-effort with no value', () => {
+  const result = runNode(['codex-task.mjs', '--prompt', 'noop', '--reasoning-effort']);
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /--reasoning-effort requires a value/);
+});
+
+test('codex-task composes -c model_reasoning_effort and echoes reasoningEffort when set', () => {
+  const fake = makeFakeCodex();
+  const argvOut = join(fake.dir, 'argv-out.json');
+  const result = runNode(['codex-task.mjs', '--prompt', 'noop', '--reasoning-effort', 'high'], {
+    env: {
+      ...process.env,
+      PATH: `${fake.dir}${delimiter}${process.env.PATH}`,
+      FAKE_CODEX_ARGV_OUT: argvOut,
+    },
+  });
+
+  assert.equal(result.status, 0);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.reasoningEffort, 'high');
+
+  const argv = JSON.parse(readFileSync(argvOut, 'utf8'));
+  const cIndex = argv.indexOf('-c');
+  assert.notEqual(cIndex, -1);
+  assert.match(argv[cIndex + 1], /^model_reasoning_effort=("?)high\1$/);
+});
+
+test('codex-task omits -c and reports reasoningEffort null when unset', () => {
+  const fake = makeFakeCodex();
+  const argvOut = join(fake.dir, 'argv-out.json');
+  const result = runNode(['codex-task.mjs', '--prompt', 'noop'], {
+    env: {
+      ...process.env,
+      PATH: `${fake.dir}${delimiter}${process.env.PATH}`,
+      FAKE_CODEX_ARGV_OUT: argvOut,
+    },
+  });
+
+  assert.equal(result.status, 0);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.reasoningEffort, null);
+
+  const argv = JSON.parse(readFileSync(argvOut, 'utf8'));
+  assert.equal(argv.indexOf('-c'), -1);
+});
+
 test('installer lists all supported harness targets without requiring codex', () => {
   const result = runNode(['install.mjs', '--list-targets']);
 
@@ -126,6 +174,9 @@ function fakeCodexJs(resultJson) {
     '}',
     "console.log('FAKE_STDOUT');",
     "console.error('FAKE_STDERR');",
+    "if (process.env.FAKE_CODEX_ARGV_OUT) {",
+    '  writeFileSync(process.env.FAKE_CODEX_ARGV_OUT, JSON.stringify(args));',
+    '}',
     "const i = args.indexOf('--output-last-message');",
     "if (i === -1 || !args[i + 1]) process.exit(2);",
     `writeFileSync(args[i + 1], ${JSON.stringify(resultJson)} + '\\n');`,

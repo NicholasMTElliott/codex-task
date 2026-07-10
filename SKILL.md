@@ -39,7 +39,8 @@ Codex can access the web when the prompt explicitly asks it to search. No wrappe
 node <<SCRIPT_PATH>> ( --prompt "<task>" | --prompt-file <path> ) \
   [--cwd DIR] [--out FILE] [--debug] [--quiet] \
   [--stream-thinking] [--track-references] \
-  [--model MODEL] [--permissions read-only|workspace-write|danger-full-access] \
+  [--model MODEL] [--reasoning-effort LEVEL] \
+  [--permissions read-only|workspace-write|danger-full-access] \
   [--profile NAME]
 ```
 
@@ -56,7 +57,13 @@ node <<SCRIPT_PATH>> ( --prompt "<task>" | --prompt-file <path> ) \
 
 #### Codex pass-throughs
 
-- `--model` (optional, default `gpt-5.5`). Model codex should use. The set of supported values is plan-dependent and not enumerable from the CLI — codex validates server-side and returns an error for anything your plan doesn't include. Common known names: `gpt-5.5`, `gpt-5.5-codex`, `gpt-5`, `gpt-5-codex`. Pick a stronger model for complex refactors / investigations; the default is fine for most tasks.
+- `--model` (optional, default `gpt-5.5`). Model codex should use. The set of supported values is plan-dependent and not enumerable from the CLI — codex validates server-side and returns an error for anything your plan doesn't include. Common known names: `gpt-5.5`, `gpt-5.5-codex`, `gpt-5`, `gpt-5-codex`, and the GPT-5.6 tiers `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna`. Pick a stronger model for complex refactors / investigations; the default is fine for most tasks.
+  - GPT-5.6 tier guidance (2026-07-09, CLI-validated with codex-cli 0.144.1: all three names accepted `--model` and completed a trivial prompt):
+    - `gpt-5.6-sol` — flagship. Additionally accepts `--reasoning-effort max` and `ultra` (CLI-validated: both exit 0).
+    - `gpt-5.6-terra` — balanced default among the 5.6 tier. Effort enum CLI-validated via a server 400: `none|minimal|low|medium|high|xhigh`.
+    - `gpt-5.6-luna` — cheap/fast.
+  - Effort sets are model- and plan-dependent (not just a fixed list), which is why the wrapper never validates `--reasoning-effort` client-side — codex is the source of truth.
+- `--reasoning-effort` (optional, unset by default). Reasoning effort level, passed through to codex as `-c model_reasoning_effort="<level>"`. Plan- and model-dependent; codex validates server-side, so the wrapper performs no client-side enumeration. Commonly-seen levels (hints only, not a validated enum): `minimal|low|medium|high|xhigh`, plus `max`/`ultra` on some tiers (e.g. `gpt-5.6-sol`).
 - `--permissions` (optional, default `read-only`). Sandbox policy for codex. Maps to codex's `--sandbox` flag (approval is always `never` because this wrapper is non-interactive):
   - `read-only` (default) — codex can read but not modify any file in the workspace. Use for investigations, audits, codebase questions.
   - `workspace-write` — codex can read AND write inside `--cwd`. Files outside the workdir remain read-only. Use for refactors and edits.
@@ -92,9 +99,18 @@ JSON on stdout. Always inspect `ok`, `taskResult`, and `warnings` before acting 
   "sessionDir":  null,
   "model":       "gpt-5.5",
   "permissions": "workspace-write",
+  "reasoningEffort": null,
   "warnings":    [],
   "durationMs":  84210
 }
+```
+
+When `--reasoning-effort high` is passed, `reasoningEffort` echoes the resolved level instead of `null`:
+
+```json
+  "model":       "gpt-5.6-terra",
+  "permissions": "workspace-write",
+  "reasoningEffort": "high",
 ```
 
 #### Field semantics
@@ -116,6 +132,7 @@ JSON on stdout. Always inspect `ok`, `taskResult`, and `warnings` before acting 
 - `workdir` — absolute path of the directory codex worked inside. Same as `--cwd` resolved against caller cwd.
 - `sessionDir` — `null` after the default cleanup; the absolute scratch dir path otherwise (on failure or `--debug`). Lives under OS temp, not under the workdir.
 - `model` / `permissions` — the resolved values for this run. Useful so callers don't have to re-derive what was passed.
+- `reasoningEffort` — the resolved `--reasoning-effort` level for this run, or `null` if the flag was omitted.
 - `warnings` — non-fatal anomalies (unknown action verbs, missing schema fields, cleanup failures). Worth re-reading before acting.
 - `durationMs` — wall-clock duration of the codex run plus this wrapper's overhead.
 
@@ -150,3 +167,4 @@ JSON on stdout. Always inspect `ok`, `taskResult`, and `warnings` before acting 
 - `error: "codex final message is not valid JSON and contains no extractable JSON object"` — codex's final message was prose, not JSON. The wrapper strips ` ```json ` fences and falls back to extracting the first balanced `{...}` block, so this only fires when codex truly went off-script. Re-run with a clearer brief.
 - `warnings` non-empty + `ok: true` — completed with normalization or cleanup notes. Read the warnings, possibly re-run if the data you need is missing.
 - `error: model "X" is not supported when using Codex with a ChatGPT account` — pass a model your plan supports (e.g. omit `--model` to use the default `gpt-5.5`).
+- Diagnostic tail mentioning `model_reasoning_effort` / "reasoning effort" — the chosen `--reasoning-effort` level isn't supported for this model/plan; drop `--reasoning-effort` or pick a supported level (e.g. `low`, `medium`, `high`).
