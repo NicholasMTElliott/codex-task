@@ -9,6 +9,7 @@ Wrap `codex exec` so a parent agent can hand a free-form prompt to codex, let co
 - A **taskResult** enum (`completed|partial|blocked|failed`) that says whether the requested outcome actually happened.
 - A longer **details** field (markdown explaining reasoning, caveats, follow-ups).
 - A per-file **files** map (`<path>` → `created|deleted|edited` by default; `referenced` included only with `--track-references`) so the parent agent can audit changes without reading codex's full transcript.
+- A **reasoningEffort** echo (`null` when unset) so callers can see whether `--reasoning-effort` was passed.
 
 Billing flows through the ChatGPT subscription as long as `OPENAI_API_KEY` is unset in the spawned env.
 
@@ -17,7 +18,8 @@ Billing flows through the ChatGPT subscription as long as `OPENAI_API_KEY` is un
 ### Inputs
 - `--prompt` / `--prompt-file` — the task description. Inline or from a UTF-8 text file. Mutually exclusive. File variant useful for long multi-line briefs that don't shell-escape cleanly; trailing whitespace trimmed, internal newlines preserved.
 - `--cwd` — working directory codex operates inside (relative or absolute; default: caller cwd). Codex's sandbox is bounded by this directory (modulo `--permissions danger-full-access`).
-- `--model` — codex model name. Default: `gpt-5.5`. The supported set is plan-dependent and not enumerable from the CLI; codex returns 400 with "not supported when using Codex with a ChatGPT account" for anything the user's plan doesn't include. Common known values surfaced in `--help`: `gpt-5.5`, `gpt-5.5-codex`, `gpt-5`, `gpt-5-codex`.
+- `--model` — codex model name. Default: `gpt-5.5`. The supported set is plan-dependent and not enumerable from the CLI; codex returns 400 with "not supported when using Codex with a ChatGPT account" for anything the user's plan doesn't include. Common known values surfaced in `--help`: `gpt-5.5`, `gpt-5.5-codex`, `gpt-5`, `gpt-5-codex`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`.
+- `--reasoning-effort` — optional model reasoning effort pass-through. Emits codex `-c model_reasoning_effort="<level>"`; wrapper does not enumerate or validate because accepted values are model-/plan-dependent and validated server-side. Probed 2026-07-09 on codex-cli 0.144.1: terra accepts `none|minimal|low|medium|high|xhigh`; sol additionally accepts `max` and `ultra`.
 - `--permissions` — sandbox policy. Default `read-only`. Values: `read-only` (codex can read but not modify the workspace), `workspace-write` (codex can read AND write inside `--cwd`), `danger-full-access` (codex can write anywhere). Maps directly to codex's supported `--sandbox` values. Approval is always `never` in the wrapper since it's non-interactive.
 - `--profile` — optional codex config profile name (pass-through to codex's `--profile`).
 - `--out` — also write the result JSON to this file path (still printed to stdout). Useful for piping or persistence.
@@ -28,8 +30,8 @@ Billing flows through the ChatGPT subscription as long as `OPENAI_API_KEY` is un
 
 ### Behavior
 - The tool builds a wrapper prompt: a fixed preamble explaining that the agent's FINAL message must be a single JSON object of a specific shape (with a `read-only`-aware addendum when applicable), followed by the user's task.
-- Preflights `codex --version`; missing/not-runnable Codex returns structured JSON before attempting a run. Then spawns `codex exec` with `--skip-git-repo-check`, `--ephemeral`, `--sandbox <mapped from --permissions>`, `--cd <workdir>`, `--model <model>`, `--output-last-message <sessionDir>/last-message.txt`, plus `--profile <name>` conditionally. `OPENAI_API_KEY` is deleted from the spawned env. Prompt is piped via stdin.
-- Codex's stdout/stderr is captured to bounded tails and is NOT streamed by default. `--stream-thinking` mirrors it live to wrapper stderr. Our stdout is reserved for the final JSON result. Non-zero exits surface the diagnostic tail with hints for auth, quota, model support, and sandbox failures.
+- Preflights `codex --version`; missing/not-runnable Codex returns structured JSON before attempting a run. Then spawns `codex exec` with `--skip-git-repo-check`, `--ephemeral`, `--sandbox <mapped from --permissions>`, `--cd <workdir>`, `--model <model>`, `--output-last-message <sessionDir>/last-message.txt`, optional `-c model_reasoning_effort="<level>"`, plus `--profile <name>` conditionally. `OPENAI_API_KEY` is deleted from the spawned env. Prompt is piped via stdin.
+- Codex's stdout/stderr is captured to bounded tails and is NOT streamed by default. `--stream-thinking` mirrors it live to wrapper stderr. Our stdout is reserved for the final JSON result. Non-zero exits surface the diagnostic tail with hints for auth, quota, model support, reasoning effort rejection, and sandbox failures.
 - After codex exits cleanly, the tool reads `<sessionDir>/last-message.txt` (codex's CLI process writes this — bypasses the model sandbox), tries strict `JSON.parse`, falls back to fence stripping and balanced-brace extraction if the model added prose around the JSON, validates the shape, normalizes sloppy fields, filters referenced files unless `--track-references`, and emits the final JSON. `ok` is true only when `taskResult` is `completed`.
 - On success without `--debug`, removes the scratch dir. On failure or `--debug`, preserves it; failures surface `sessionDir` in the JSON so the caller can inspect codex's interim output.
 
@@ -45,6 +47,7 @@ Billing flows through the ChatGPT subscription as long as `OPENAI_API_KEY` is un
   "sessionDir":  null,
   "model":       "<model used>",
   "permissions": "<permissions mode used>",
+  "reasoningEffort": null,
   "warnings":    [],
   "durationMs":  12345
 }

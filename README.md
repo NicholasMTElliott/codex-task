@@ -21,6 +21,7 @@ Single mode: feed it a `--prompt` (or `--prompt-file`), it runs `codex exec` aga
   "sessionDir":  null,
   "model":       "gpt-5.5",
   "permissions": "workspace-write",
+  "reasoningEffort": null,
   "warnings":    [],
   "durationMs":  84210
 }
@@ -122,13 +123,14 @@ node ~/.codex-task/codex-task.mjs \
   --prompt "Rename getCwd to getCurrentWorkingDirectory across the repo, including tests."
 ```
 
-With a long brief from a file, a specific model, and persistent output:
+With a long brief from a file, a specific model, explicit reasoning effort, and persistent output:
 
 ```bash
 node ~/.codex-task/codex-task.mjs \
   --prompt-file ./refactor-brief.md \
   --permissions workspace-write \
-  --model gpt-5.5-codex \
+  --model gpt-5.6-terra \
+  --reasoning-effort high \
   --cwd path/to/project \
   --out /tmp/refactor-result.json
 ```
@@ -155,7 +157,13 @@ Output is JSON on stdout. Codex's own progress chatter is captured silently by d
 
 #### Codex pass-throughs
 
-- `--model` (optional, default `gpt-5.5`). Model codex should use. The set of supported values is plan-dependent — codex validates server-side and returns an error for anything your plan doesn't include. Common known names: `gpt-5.5`, `gpt-5.5-codex`, `gpt-5`, `gpt-5-codex`.
+- `--model` (optional, default `gpt-5.5`). Model codex should use. The set of supported values is plan-dependent — codex validates server-side and returns an error for anything your plan doesn't include. Common known names: `gpt-5.5`, `gpt-5.5-codex`, `gpt-5`, `gpt-5-codex`, and the GPT-5.6 tiers `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna`.
+  - GPT-5.6 tier guidance (2026-07-09, CLI-validated with codex-cli 0.144.1: all three names accepted `--model` and completed a trivial prompt):
+    - `gpt-5.6-sol` — flagship. Additionally accepts `--reasoning-effort max` and `ultra` (CLI-validated: both exit 0).
+    - `gpt-5.6-terra` — balanced default among the 5.6 tier. Effort enum CLI-validated via a server 400: `none|minimal|low|medium|high|xhigh`.
+    - `gpt-5.6-luna` — cheap/fast.
+  - Effort sets are model- and plan-dependent (not just a fixed list), which is why the wrapper never validates `--reasoning-effort` client-side — codex is the source of truth.
+- `--reasoning-effort` (optional, unset by default). Reasoning effort level, passed through to codex as `-c model_reasoning_effort="<level>"`. Plan- and model-dependent; codex validates server-side, so the wrapper performs no client-side enumeration. Commonly-seen levels (hints only, not a validated enum): `minimal|low|medium|high|xhigh`, plus `max`/`ultra` on some tiers (e.g. `gpt-5.6-sol`).
 - `--permissions` (optional, default `read-only`). Sandbox policy for codex. Maps to codex's `--sandbox`:
   - `read-only` (default) — codex can read but not modify any file in the workspace.
   - `workspace-write` — codex can read AND write inside `--cwd`. Files outside the workdir remain read-only.
@@ -187,9 +195,18 @@ There is no wrapper `--search` flag. If the delegated task needs current web inf
   "sessionDir":  null,
   "model":       "<model used>",
   "permissions": "<permissions mode used>",
+  "reasoningEffort": null,
   "warnings":    [],
   "durationMs":  12345
 }
+```
+
+When `--reasoning-effort high` is passed, `reasoningEffort` echoes the resolved level instead of `null`:
+
+```json
+  "model":       "gpt-5.6-terra",
+  "permissions": "workspace-write",
+  "reasoningEffort": "high",
 ```
 
 `ok` is `true` only when codex exits cleanly, its final message parses, and `taskResult` is `completed`. On `false`, inspect `taskResult`, `error`, `details`, and `warnings`; `sessionDir` is preserved for wrapper/runtime failures.
@@ -211,6 +228,8 @@ There is no wrapper `--search` flag. If the delegated task needs current web inf
 If codex returns an unknown action verb (`"modified"`, `"updated"`, etc.), the wrapper coerces it to `"referenced"` and emits a warning rather than failing the run. Referenced entries are omitted unless `--track-references` is set.
 
 Inspect `warnings` for non-fatal anomalies: unknown action verbs, missing schema fields, cleanup failures.
+
+`reasoningEffort` is the resolved `--reasoning-effort` level for this run, or `null` if the flag was omitted.
 
 ## Using it from a coding-agent harness
 
@@ -262,6 +281,8 @@ The installer is idempotent: re-running overwrites the installed copy in `~/.cod
 7. **`codex` is not installed** — the wrapper checks `codex --version` before spending a run. If the binary is missing or not runnable, the JSON error tells you to install Codex and run `codex login`.
 
 8. **Not logged in** — if `codex exec` returns an auth-shaped failure (`401`, missing bearer token, expired login), the JSON error includes the diagnostic tail and tells you to run `codex login`.
+
+9. **Reasoning effort rejected** — if the diagnostic tail mentions `model_reasoning_effort` or reasoning effort, the chosen `--reasoning-effort` level is not supported for that model/plan. Drop the flag or pick a supported level such as `low`, `medium`, or `high`.
 
 ## Cost & timing
 

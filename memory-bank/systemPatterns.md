@@ -7,7 +7,7 @@ Single-process Node ESM script. No daemon, no state, no IPC beyond the spawned c
 caller (Claude Code / opencode / shell)
    │  --prompt / --prompt-file
    │  --cwd / --out / --debug / --quiet / --stream-thinking / --track-references
-   │  --model / --permissions / --profile
+   │  --model / --reasoning-effort / --permissions / --profile
    ▼
 codex-task.mjs
    │  parseArgs → resolve workdir → mkdir <os.tmpdir()>/codex-task/<sessionId>/
@@ -24,6 +24,7 @@ codex-task.mjs
    │      --cd <workdir>
    │      --model <model>
    │      --output-last-message <sessionDir>/last-message.txt
+   │      [-c model_reasoning_effort="<level>"]  # if provided
    │      [--profile <name>]       # if provided
    │  spawn with env minus OPENAI_API_KEY; prompt piped via stdin
    │  codex stdout/stderr → captured tails; mirrored to stderr only with --stream-thinking
@@ -70,9 +71,9 @@ emit JSON to stdout (and optionally --out file)
 - **Task outcome is explicit.** Codex must return `taskResult: completed|partial|blocked|failed`. Wrapper `ok` is true only for `completed`; `partial`, `blocked`, and `failed` exit nonzero with structured JSON.
 - **Reference tracking is opt-in.** By default the `files` map includes only `created|edited|deleted` entries. `referenced` entries are kept only with `--track-references`, reducing parent-agent context for normal delegation.
 - **Soft schema validation, not strict.** Missing `taskResult` / `summary` / `details` / `files` → coerced to safe defaults with warnings. Hard failures are reserved for: codex exiting non-zero, no result file written, result file not valid JSON, or root not an object.
-- **Model passes through; no client-side validation.** The set of supported models is plan-dependent and not enumerable. Codex validates server-side and returns 400 with a clear message ("not supported when using Codex with a ChatGPT account") which surfaces to the wrapper's `error` field. Wrapper just lists common known names in `--help` as hints.
+- **Model and reasoning effort pass through; no client-side validation.** The set of supported models and effort levels is plan-/model-dependent and not enumerable. Codex validates server-side and returns 400 with a clear message (model unsupported or `model_reasoning_effort` rejected), which surfaces to the wrapper's `error` field. Wrapper lists common model names and effort levels in `--help` as hints.
 - **No `full-auto` wrapper permission.** Codex deprecated the historical `--full-auto` shorthand. The wrapper accepts only canonical sandbox names: `read-only`, `workspace-write`, and `danger-full-access`.
-- **Preflight and failure hints.** Before `codex exec`, the wrapper runs `codex --version`. If the binary is missing or not runnable, it returns structured JSON with install/login guidance. Non-zero `codex exec` exits include a captured diagnostic tail and pattern-based hints for expired login (`codex login`), quota/rate limits, unsupported model, and sandbox/filesystem denials.
+- **Preflight and failure hints.** Before `codex exec`, the wrapper runs `codex --version`. If the binary is missing or not runnable, it returns structured JSON with install/login guidance. Non-zero `codex exec` exits include a captured diagnostic tail and pattern-based hints for expired login (`codex login`), quota/rate limits, unsupported model, rejected reasoning effort, and sandbox/filesystem denials.
 
 ## Component relationships
 
@@ -86,14 +87,14 @@ emit JSON to stdout (and optionally --out file)
 Same `TARGETS` registry pattern as `codex-image-gen`. See `codex-image-gen/memory-bank/systemPatterns.md` for the full flow — only the install dir (`~/.codex-task/`) and skill subfolder name (`codex-task`) differ.
 
 ### Run
-1. `parseArgs(process.argv.slice(2))` — resolve `--prompt` / `--prompt-file` (mutually exclusive; UTF-8 read with `.trim()`, empty-after-trim rejected); resolve `--cwd` (relative or absolute; defaults to caller cwd; must exist or exit 2); validate `--permissions` against `read-only|workspace-write|danger-full-access` (default `read-only`); parse `--stream-thinking` and `--track-references`; take `--model` verbatim (default `gpt-5.5`) and pass `--profile` through if present. `-h`/`--help` prints usage to stdout, exits 0.
+1. `parseArgs(process.argv.slice(2))` — resolve `--prompt` / `--prompt-file` (mutually exclusive; UTF-8 read with `.trim()`, empty-after-trim rejected); resolve `--cwd` (relative or absolute; defaults to caller cwd; must exist or exit 2); validate `--permissions` against `read-only|workspace-write|danger-full-access` (default `read-only`); parse `--stream-thinking` and `--track-references`; take `--model` verbatim (default `gpt-5.5`); take optional `--reasoning-effort` verbatim (must have a value; no local enum); and pass `--profile` through if present. `-h`/`--help` prints usage to stdout, exits 0.
 2. Make `<os.tmpdir()>/codex-task/<sessionId>/` with `<sessionId>` = `<timestamp>-<pid>`. Pre-allocate the result-file path inside.
 3. Build the wrapper prompt: fixed preamble telling the model its FINAL message must be a single JSON object with `taskResult`, `summary`, `details`, `files` + user task + (when `--permissions=read-only`) a read-only addendum telling codex to set `taskResult:"blocked"` for blocked writes. The prompt asks for referenced files only under `--track-references`.
-4. Build the spawn args: `exec --skip-git-repo-check --ephemeral --sandbox <mapped> --cd <workdir> --model <model> --output-last-message <sessionDir>/last-message.txt`, plus `--profile <name>` if provided. Approval defaults to `never` automatically in `codex exec`. There is no wrapper `--search` flag; when the task prompt explicitly asks for web research, Codex can use web search from `codex exec`.
+4. Build the spawn args: `exec --skip-git-repo-check --ephemeral --sandbox <mapped> --cd <workdir> --model <model> --output-last-message <sessionDir>/last-message.txt`, plus `-c model_reasoning_effort="<level>"` and `--profile <name>` if provided. Approval defaults to `never` automatically in `codex exec`. There is no wrapper `--search` flag; when the task prompt explicitly asks for web research, Codex can use web search from `codex exec`.
 5. Preflight `codex --version` with `OPENAI_API_KEY` deleted. Missing or not-runnable Codex emits `ok:false` JSON with a direct install/login diagnostic. Scratch preserved.
 6. Spawn with `OPENAI_API_KEY` deleted. Stdout/stderr are piped and tailed. They are mirrored live to wrapper stderr only when `--stream-thinking && !--quiet`. Prompt via stdin.
 7. On spawn failure → emit `ok:false` with `error: "failed to spawn codex: …"`. Scratch preserved.
-8. On non-zero exit → emit `ok:false` with `error: "codex exited with code N. <common hint> Diagnostic tail: …"`. Scratch preserved.
+8. On non-zero exit → emit `ok:false` with `error: "codex exited with code N. <common hint> Diagnostic tail: …"`. Hints cover auth, quota, unsupported model, rejected reasoning effort, and sandbox/filesystem denial. Scratch preserved.
 9. On zero exit → read `<sessionDir>/last-message.txt`:
    - File missing → emit `ok:false`, "codex did not write a final message file at …". Scratch preserved.
    - Empty file → emit `ok:false`, "codex final message was empty". Scratch preserved.
@@ -103,7 +104,7 @@ Same `TARGETS` registry pattern as `codex-image-gen`. See `codex-image-gen/memor
    - Root not an object → emit `ok:false`, "result root is not a JSON object". Scratch preserved.
 10. `normalizeResult(parsed)` — validate/coerce `taskResult`; coerce missing/wrong-type `summary`/`details`/`files` to safe defaults with warnings; iterate `files`, coerce unknown action verbs to `"referenced"` with per-entry warnings; omit referenced entries unless `--track-references`.
 11. Unless `--debug`: `rmSync(sessionDir, {recursive:true, force:true})`. Failures recorded as warnings, run still `ok:true`.
-12. Emit JSON: `{ ok, taskResult, summary, details, files, workdir, sessionDir: null|<path>, model, permissions, warnings, durationMs }`. Also write to `--out` path if set. Exit 0 only for `taskResult:"completed"`.
+12. Emit JSON: `{ ok, taskResult, summary, details, files, workdir, sessionDir: null|<path>, model, permissions, reasoningEffort, warnings, durationMs }`. Also write to `--out` path if set. Exit 0 only for `taskResult:"completed"`.
 
 ### Manual permission matrix
 `scripts/permission-matrix.mjs` is a manual harness, not part of `npm test`. It defaults to `../kva` but accepts `--target DIR`. It runs three tasks (read features, write `FEATURES.<run>.md` in workspace, write `FEATURES.<run>.md` to parent dir) against the three permission modes. Expected behavior: `read-only` only read succeeds; `workspace-write` read + workspace write succeed; `danger-full-access` all three succeed. Blocked cases now require wrapper `ok:false`, `taskResult:blocked|failed`, and no created file. It writes run artifacts under repo-local `tmp/permission-matrix/` and uses unique probe filenames so it does not overwrite a real `FEATURES.md`.
@@ -114,6 +115,6 @@ Same `TARGETS` registry pattern as `codex-image-gen`. See `codex-image-gen/memor
 - Session dirs live outside the user's workdir — always under `<os.tmpdir()>/codex-task/`.
 - Stdout output is always a single valid JSON object — never partial, never interleaved with codex chatter, even on failure paths.
 - The result schema's `files` map always uses allowed action verbs. Anything unknown is rewritten to `"referenced"` with a warning before emit, and omitted unless `--track-references`.
-- The JSON always surfaces `model` and `permissions` — even on failure — so the caller can see what the wrapper actually asked codex to do.
+- The JSON always surfaces `model`, `permissions`, and `reasoningEffort` (null when unset) — even on failure — so the caller can see what the wrapper actually asked codex to do.
 - On `ok: true`, `taskResult:"completed"`, `summary` / `details` / `files` are present (possibly empty strings / empty object) and `sessionDir` is `null` (cleaned up) unless `--debug`.
 - On `ok: false`, `sessionDir` is non-null and points at the preserved scratch dir.
