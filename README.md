@@ -76,10 +76,22 @@ cd codex-task
 node install.mjs
 ```
 
+The runtime bin also forwards installer flags, so a copy of `codex-task.mjs` that has `install.mjs` next to it (repo checkout, npm package dir, or a `~/.codex-task/` written by a current installer) can run the installer. If `install.mjs` is missing (e.g. a `~/.codex-task/` from an older installer), the runtime prints a plain error to stderr and exits 1:
+
+```bash
+codex-task --install            # same as node install.mjs
+codex-task --list-targets
+codex-task --uninstall
+```
+
+Target-selection flags (`--target=`, `--all`, `--no-<id>`) forward too, e.g. `codex-task --install --target=claude,cursor`.
+
+If you invoke the runtime for a task and the skill is **not** registered with any known harness, it prints a one-line warning to stderr and adds the same message to the result's `warnings` array — the run itself proceeds normally. Silence it with `--no-install-check` or `CODEX_TASK_SKIP_INSTALL_CHECK=1`.
+
 ### What the installer does
 
 1. Verifies `node` and `codex` are on `PATH`.
-2. Copies `codex-task.mjs` and `README.md` to `~/.codex-task/` (shared across all harnesses).
+2. Copies `codex-task.mjs`, `install.mjs`, `SKILL.md`, and `README.md` to `~/.codex-task/` (shared across all harnesses; the installer and template are included so `node ~/.codex-task/codex-task.mjs --install` / `--uninstall` keep working from the installed copy).
 3. Renders `SKILL.md` with the absolute install path baked in.
 4. For each selected target harness, drops the rendered SKILL.md into the harness's user-global skills dir:
    - `~/.claude/skills/codex-task/SKILL.md` (Claude Code)
@@ -100,10 +112,12 @@ node install.mjs
 | `--list-targets` | Print the target table with detection state and exit without installing. |
 | `--uninstall` | Remove the install dir plus every known target's skill dir. Settings files are left alone — remove allow rules manually if you want them gone. |
 
+All flags work identically through the runtime bin: `codex-task --install --no-opencode`, `codex-task --list-targets`, etc.
+
 To remove:
 
 ```bash
-node install.mjs --uninstall
+node install.mjs --uninstall     # or: codex-task --uninstall
 ```
 
 ## Manual invocation
@@ -181,6 +195,7 @@ There is no wrapper `--search` flag. If the delegated task needs current web inf
 - `--stream-thinking` (optional flag). Mirror Codex live stdout/stderr to wrapper stderr. Default is silent capture only.
 - `--track-references` (optional flag). Include `referenced` entries in `files`. Default omits referenced-only files.
 - `--quiet` (optional flag). Compatibility flag; live thinking is already off by default, and `--quiet` suppresses streaming even when combined with `--stream-thinking`.
+- `--no-install-check` (optional flag). Skip the startup check that warns when the codex-task skill is not registered with any known harness. The warning goes to stderr and into the result's `warnings` array; it never blocks the run. `CODEX_TASK_SKIP_INSTALL_CHECK=1` in the environment has the same effect.
 
 ### Output JSON shape
 
@@ -274,7 +289,7 @@ The installer is idempotent: re-running overwrites the installed copy in `~/.cod
 
 4. **`error: "codex did not write a final message file…"`** or **`"codex final message was empty"`** — codex finished cleanly but produced no final-message text. Probably the prompt confused it (e.g. you asked an open-ended question that codex answered conversationally without performing any task). Re-run with a clearer brief, or pass `--debug` and inspect `sessionDir` to see codex's actual output.
 
-5. **Skill not auto-invoked from your agent** — verify install state with `node install.mjs --list-targets`, then for each detected harness check the skill file exists and contains an absolute path (no `<<INSTALL_PATH>>` / `<<SCRIPT_PATH>>` placeholders left). **Restart the agent** if it was running when you installed.
+5. **Skill not auto-invoked from your agent** — verify install state with `node install.mjs --list-targets` (or `codex-task --list-targets`), then for each detected harness check the skill file exists and contains an absolute path (no `<<INSTALL_PATH>>` / `<<SCRIPT_PATH>>` placeholders left). **Restart the agent** if it was running when you installed. The runtime also warns on stderr (and in the JSON `warnings` array) when no harness has the skill registered — if you're seeing that warning, run `codex-task --install`.
 
 6. **Worried about accidental API billing** — the wrapper strips `OPENAI_API_KEY` from the spawned env before invoking codex, so subscription routing is locked in regardless of what your shell has set.
 

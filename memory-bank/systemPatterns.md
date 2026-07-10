@@ -1,7 +1,7 @@
 # systemPatterns
 
 ## Architecture
-Single-process Node ESM script. No daemon, no state, no IPC beyond the spawned codex child. One subcommand: read prompt, build wrapper prompt, spawn codex, wait, read structured result file, emit JSON.
+Single-process Node ESM script. No daemon, no state, no IPC beyond the spawned codex child. One task path: read prompt, build wrapper prompt, spawn codex, wait, read structured result file, emit JSON. Installer flags short-circuit to a forwarded install.mjs run before any task parsing.
 
 ```
 caller (Claude Code / opencode / shell)
@@ -10,7 +10,11 @@ caller (Claude Code / opencode / shell)
    │  --model / --reasoning-effort / --permissions / --profile
    ▼
 codex-task.mjs
-   │  parseArgs → resolve workdir → mkdir <os.tmpdir()>/codex-task/<sessionId>/
+   │  installer dispatch: --install/--uninstall/--list-targets →
+   │    spawnSync(node, sibling install.mjs, forwarded flags) → exit
+   │  parseArgs → skill-registration check (warn-only; stderr + warnings[];
+   │    skipped by --no-install-check / CODEX_TASK_SKIP_INSTALL_CHECK=1)
+   │  resolve workdir → mkdir <os.tmpdir()>/codex-task/<sessionId>/
    │  codex --version preflight (structured error if missing/not runnable)
    │  buildPrompt (tell model: your FINAL message must be a single JSON
    │               object of this shape; add a read-only addendum when
@@ -75,10 +79,14 @@ emit JSON to stdout (and optionally --out file)
 - **No `full-auto` wrapper permission.** Codex deprecated the historical `--full-auto` shorthand. The wrapper accepts only canonical sandbox names: `read-only`, `workspace-write`, and `danger-full-access`.
 - **Preflight and failure hints.** Before `codex exec`, the wrapper runs `codex --version`. If the binary is missing or not runnable, it returns structured JSON with install/login guidance. Non-zero `codex exec` exits include a captured diagnostic tail and pattern-based hints for expired login (`codex login`), quota/rate limits, unsupported model, rejected reasoning effort, and sandbox/filesystem denials.
 
+- **Installer dispatch lives in the runtime bin.** `codex-task.mjs` forwards `--install` / `--uninstall` / `--list-targets` (plus `--target=` / `--all` / `--no-<id>`) to a sibling `install.mjs` via `spawnSync(process.execPath, ...)` and exits with its status. Rationale: after `npm install -g codex-task`, only the `codex-task` bin is on PATH; without dispatch the installer would be buried in npm's global `node_modules`. The two files stay separate (single-file-runtime comprehensibility preserved); dispatch happens before `parseArgs` so installer flags never collide with task flags. The detection scan is value-aware: it skips tokens that are values of value-taking task flags (`VALUE_TAKING_FLAGS`, mirroring parseArgs), so `--prompt "--install"` runs as a task. `--no-install-check` is stripped before forwarding since it's a runtime flag. `spawnSync` failures are surfaced: `r.error` and `r.signal` each get a stderr diagnostic before exit 1.
+- **Not-installed warning, never a block.** On every task run (before workdir resolution), the runtime probes each known harness skill path (`skillProbePaths()` — a duplicated list deliberately kept in sync with `TARGETS` in install.mjs, because the installed `~/.codex-task/codex-task.mjs` copy historically stood alone and must not hard-import install.mjs). If NO harness has the skill, a one-line warning goes to stderr AND the result `warnings` array (stdout JSON contract intact). The whole probe is wrapped in try/catch — `os.homedir()` can throw (Windows with HOME/USERPROFILE empty) and a check failure must never abort the run; it degrades to a `warnings` entry. Escape hatches: `--no-install-check` flag, `CODEX_TASK_SKIP_INSTALL_CHECK=1` env (the test suite sets the env var to stay hermetic; empty string counts as unset). Drift in the probe list only degrades warning accuracy, never run correctness.
+- **Installer copies itself.** `install.mjs` copies `install.mjs` + `SKILL.md` (alongside the tool + README) into `~/.codex-task/`, so installer-mode flags keep working from the installed copy. Copies are guarded against same-path self-copy (re-running from `~/.codex-task/` itself; Windows compares case-insensitively).
+
 ## Component relationships
 
-- `codex-task.mjs` — runtime. Pure: parse args → build wrapper prompt → spawn codex → read result file → normalize → emit JSON.
-- `install.mjs` — multi-target installer. Verifies `node` + `codex` on PATH, copies the tool to `~/.codex-task/`, renders SKILL.md, then iterates a `TARGETS` registry to drop the rendered skill into each selected harness's user-global skills dir. For Claude Code, also idempotently patches `~/.claude/settings.json` `permissions.allow` with the `Bash(node <SCRIPT_PATH> *)` rule. Other harnesses are permissive by default and get no settings patch. The `agents` cross-harness target is `explicitOnly: true`. Flags: `--target=<csv>` / `--all` / `--no-<id>` / `--list-targets` / `--uninstall`.
+- `codex-task.mjs` — runtime. Pure: parse args → build wrapper prompt → spawn codex → read result file → normalize → emit JSON. Also owns installer dispatch (forwards to sibling `install.mjs`) and the warn-only skill-registration check.
+- `install.mjs` — multi-target installer. Verifies `node` + `codex` on PATH, copies the tool + `install.mjs` + `SKILL.md` template (+ README) to `~/.codex-task/`, renders SKILL.md, then iterates a `TARGETS` registry to drop the rendered skill into each selected harness's user-global skills dir. For Claude Code, also idempotently patches `~/.claude/settings.json` `permissions.allow` with the `Bash(node <SCRIPT_PATH> *)` rule. Other harnesses are permissive by default and get no settings patch. The `agents` cross-harness target is `explicitOnly: true`. Flags: `--target=<csv>` / `--all` / `--no-<id>` / `--list-targets` / `--uninstall`.
 - `SKILL.md` — Anthropic-style skill template (frontmatter: `name` + `description` + `allowed-tools`). Tells the agent when to invoke and what arguments to pass. The invocation guidance is writing-first: proactively delegate docs, summaries, changelogs, release notes, README work, and prose-heavy analysis; delegate coding/code execution only when specifically requested or clearly required. Two placeholders (`<<INSTALL_PATH>>` / `<<SCRIPT_PATH>>`) are rendered by the installer.
 
 ## Critical flows
@@ -87,8 +95,9 @@ emit JSON to stdout (and optionally --out file)
 Same `TARGETS` registry pattern as `codex-image-gen`. See `codex-image-gen/memory-bank/systemPatterns.md` for the full flow — only the install dir (`~/.codex-task/`) and skill subfolder name (`codex-task`) differ.
 
 ### Run
-1. `parseArgs(process.argv.slice(2))` — resolve `--prompt` / `--prompt-file` (mutually exclusive; UTF-8 read with `.trim()`, empty-after-trim rejected); resolve `--cwd` (relative or absolute; defaults to caller cwd; must exist or exit 2); validate `--permissions` against `read-only|workspace-write|danger-full-access` (default `read-only`); parse `--stream-thinking` and `--track-references`; take `--model` verbatim (default `gpt-5.5`); take optional `--reasoning-effort` verbatim (must have a value; no local enum); and pass `--profile` through if present. `-h`/`--help` prints usage to stdout, exits 0.
-2. Make `<os.tmpdir()>/codex-task/<sessionId>/` with `<sessionId>` = `<timestamp>-<pid>`. Pre-allocate the result-file path inside.
+0. `maybeRunInstaller` — if argv contains `--install` / `--uninstall` / `--list-targets` as a flag position (the scan skips values of value-taking task flags, so `--prompt "--install"` stays a task), forward everything (minus `--install` and `--no-install-check`) to the sibling `install.mjs` via `spawnSync` and exit with its status. Missing install.mjs, spawn failure (`r.error`), and signal death (`r.signal`) each print a plain stderr error and exit 1 — installer mode is not a task run, so no JSON contract applies.
+1. `parseArgs(process.argv.slice(2))` — resolve `--prompt` / `--prompt-file` (mutually exclusive; UTF-8 read with `.trim()`, empty-after-trim rejected); resolve `--cwd` (relative or absolute; defaults to caller cwd; must exist or exit 2); validate `--permissions` against `read-only|workspace-write|danger-full-access` (default `read-only`); parse `--stream-thinking`, `--track-references`, and `--no-install-check`; take `--model` verbatim (default `gpt-5.5`); take optional `--reasoning-effort` verbatim (must have a value; no local enum); and pass `--profile` through if present. `-h`/`--help` prints usage to stdout, exits 0.
+2. Skill-registration check (unless `--no-install-check` / `CODEX_TASK_SKIP_INSTALL_CHECK=1`): if no known harness skill path exists, warn on stderr + push to `warnings`. Never blocks. Then make `<os.tmpdir()>/codex-task/<sessionId>/` with `<sessionId>` = `<timestamp>-<pid>`. Pre-allocate the result-file path inside.
 3. Build the wrapper prompt: fixed preamble telling the model its FINAL message must be a single JSON object with `taskResult`, `summary`, `details`, `files` + user task + (when `--permissions=read-only`) a read-only addendum telling codex to set `taskResult:"blocked"` for blocked writes. The prompt asks for referenced files only under `--track-references`.
 4. Build the spawn args: `exec --skip-git-repo-check --ephemeral --sandbox <mapped> --cd <workdir> --model <model> --output-last-message <sessionDir>/last-message.txt`, plus `-c model_reasoning_effort="<level>"` and `--profile <name>` if provided. Approval defaults to `never` automatically in `codex exec`. There is no wrapper `--search` flag; when the task prompt explicitly asks for web research, Codex can use web search from `codex exec`.
 5. Preflight `codex --version` with `OPENAI_API_KEY` deleted. Missing or not-runnable Codex emits `ok:false` JSON with a direct install/login diagnostic. Scratch preserved.

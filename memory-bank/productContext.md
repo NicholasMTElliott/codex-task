@@ -27,8 +27,11 @@ Billing flows through the ChatGPT subscription as long as `OPENAI_API_KEY` is un
 - `--stream-thinking` — opt in to mirroring Codex live stdout/stderr to wrapper stderr. Default is silent capture only.
 - `--track-references` — include `referenced` entries in the `files` map. Default omits referenced-only files to keep parent-agent context small.
 - `--quiet` — compatibility flag; suppresses live streaming even with `--stream-thinking`.
+- `--no-install-check` — skip the startup skill-registration check (also skippable via `CODEX_TASK_SKIP_INSTALL_CHECK=1`).
+- Installer mode: `--install` / `--uninstall` / `--list-targets` (plus `--target=` / `--all` / `--no-<id>`) forward the invocation to the sibling `install.mjs` and exit with its status; no task runs.
 
 ### Behavior
+- Before any task work, when the codex-task skill is not registered with any known harness (probe: `SKILL.md` under each `TARGETS` skill dir), the run proceeds but a one-line warning goes to stderr and into the result `warnings` array pointing at `codex-task --install`. Escape hatches: `--no-install-check`, `CODEX_TASK_SKIP_INSTALL_CHECK=1`.
 - The tool builds a wrapper prompt: a fixed preamble explaining that the agent's FINAL message must be a single JSON object of a specific shape (with a `read-only`-aware addendum when applicable), followed by the user's task.
 - Preflights `codex --version`; missing/not-runnable Codex returns structured JSON before attempting a run. Then spawns `codex exec` with `--skip-git-repo-check`, `--ephemeral`, `--sandbox <mapped from --permissions>`, `--cd <workdir>`, `--model <model>`, `--output-last-message <sessionDir>/last-message.txt`, optional `-c model_reasoning_effort="<level>"`, plus `--profile <name>` conditionally. `OPENAI_API_KEY` is deleted from the spawned env. Prompt is piped via stdin.
 - Codex's stdout/stderr is captured to bounded tails and is NOT streamed by default. `--stream-thinking` mirrors it live to wrapper stderr. Our stdout is reserved for the final JSON result. Non-zero exits surface the diagnostic tail with hints for auth, quota, model support, reasoning effort rejection, and sandbox failures.

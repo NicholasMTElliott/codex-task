@@ -39,10 +39,11 @@
  * No npm dependencies. Requires Node 18+ and `codex` CLI on PATH.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // Silence DEP0190 (spawn shell:true with args). shell:true is required on
 // Windows because post-CVE-2024-27980 Node refuses to spawn .cmd shims any
@@ -77,6 +78,69 @@ const PERMISSIONS = {
 };
 const DEFAULT_PERMISSIONS = 'read-only';
 
+// ---------- installer dispatch ----------
+
+// When any of these flags is present, the invocation is forwarded to
+// install.mjs, which lives next to this script in a repo checkout, in the
+// npm package dir, and (because the installer copies itself) in ~/.codex-task/.
+// This is what makes `codex-task --install` work after `npm install -g`.
+const INSTALLER_FLAGS = new Set(['--install', '--uninstall', '--list-targets']);
+
+// Task flags whose next argv token is a value, not a flag. Mirrors parseArgs.
+// The dispatch scan skips these values so a task like --prompt "--install"
+// is never misread as installer mode.
+const VALUE_TAKING_FLAGS = new Set([
+  '--prompt', '--prompt-file', '--cwd', '--out',
+  '--model', '--permissions', '--profile', '--reasoning-effort',
+]);
+
+function hasInstallerFlag(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    if (VALUE_TAKING_FLAGS.has(argv[i])) { i++; continue; }
+    if (INSTALLER_FLAGS.has(argv[i])) return true;
+  }
+  return false;
+}
+
+function maybeRunInstaller(argv) {
+  if (!hasInstallerFlag(argv)) return;
+  const installerPath = join(dirname(fileURLToPath(import.meta.url)), 'install.mjs');
+  if (!existsSync(installerPath)) {
+    process.stderr.write(
+      `error: installer not found at ${installerPath}\n`
+      + `install.mjs must live next to codex-task.mjs (repo checkout, npm package dir, or an install dir written by a current installer).\n`,
+    );
+    process.exit(1);
+  }
+  // install.mjs owns --uninstall/--list-targets/--target=/--all/--no-<id>;
+  // strip only the flags that are ours.
+  const forwarded = argv.filter((a) => a !== '--install' && a !== '--no-install-check');
+  const r = spawnSync(process.execPath, [installerPath, ...forwarded], { stdio: 'inherit' });
+  if (r.error) {
+    process.stderr.write(`error: failed to run installer: ${r.error.message}\n`);
+    process.exit(1);
+  }
+  if (r.signal) {
+    process.stderr.write(`error: installer terminated by signal ${r.signal}\n`);
+    process.exit(1);
+  }
+  process.exit(r.status ?? 1);
+}
+
+// Skill locations probed by the not-installed warning. Keep in sync with the
+// TARGETS registry in install.mjs — drift here only degrades the warning's
+// accuracy, never the correctness of a run.
+function skillProbePaths() {
+  const home = homedir();
+  return [
+    join(home, '.claude', 'skills', 'codex-task', 'SKILL.md'),
+    join(home, '.config', 'opencode', 'skills', 'codex-task', 'SKILL.md'),
+    join(home, '.cline', 'skills', 'codex-task', 'SKILL.md'),
+    join(home, '.cursor', 'skills', 'codex-task', 'SKILL.md'),
+    join(home, '.agents', 'skills', 'codex-task', 'SKILL.md'),
+  ];
+}
+
 // ---------- arg parsing ----------
 
 function parseArgs(argv) {
@@ -92,6 +156,7 @@ function parseArgs(argv) {
   let permissions = DEFAULT_PERMISSIONS;
   let profile = '';
   let reasoningEffort = null; // null = flag absent; string = resolved level
+  let noInstallCheck = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -104,6 +169,7 @@ function parseArgs(argv) {
     else if (arg === '--quiet') { quiet = true; }
     else if (arg === '--stream-thinking') { streamThinking = true; }
     else if (arg === '--track-references') { trackReferences = true; }
+    else if (arg === '--no-install-check') { noInstallCheck = true; }
     else if (arg === '--model') { model = next ?? ''; i++; }
     else if (arg === '--permissions') { permissions = (next ?? '').toLowerCase(); i++; }
     else if (arg === '--profile') { profile = next ?? ''; i++; }
@@ -125,7 +191,7 @@ function parseArgs(argv) {
     usageErr(`--permissions must be one of: ${allowed} (got "${permissions}")`);
   }
 
-  return { prompt, cwd, out, debug, quiet, streamThinking, trackReferences, model, permissions, profile, reasoningEffort };
+  return { prompt, cwd, out, debug, quiet, streamThinking, trackReferences, model, permissions, profile, reasoningEffort, noInstallCheck };
 }
 
 function usageErr(msg) {
@@ -156,9 +222,15 @@ function printUsage(stream = process.stderr) {
   node codex-task.mjs (--prompt "<text>" | --prompt-file <path>)
                       [--cwd DIR] [--out FILE] [--debug] [--quiet]
                       [--stream-thinking] [--track-references]
+                      [--no-install-check]
                       [--model MODEL] [--reasoning-effort LEVEL]
                       [--permissions ${perms}]
                       [--profile NAME]
+
+Installer mode (forwards to install.mjs; see its --help for details):
+  node codex-task.mjs --install [--target=<csv>] [--all] [--no-<id>]
+  node codex-task.mjs --uninstall
+  node codex-task.mjs --list-targets
 
 Wrap a single 'codex exec' invocation, run an arbitrary agent task, and
 capture a structured JSON result describing what files were touched.
@@ -224,6 +296,11 @@ Wrapper options:
   --track-references
                  Include "referenced" entries in the files map. By default,
                  referenced-only files are omitted so the JSON stays small.
+  --no-install-check
+                 Skip the startup check that warns (on stderr and in the
+                 result's "warnings" array) when the codex-task skill is not
+                 registered with any known coding-agent harness. Also
+                 skippable via CODEX_TASK_SKIP_INSTALL_CHECK=1.
 
 Output: JSON on stdout. Shape:
 
@@ -596,9 +673,31 @@ function emit(r, code, outPath) {
 // ---------- main ----------
 
 async function main() {
+  maybeRunInstaller(process.argv.slice(2));
   const args = parseArgs(process.argv.slice(2));
   const start = Date.now();
   const warnings = [];
+
+  // Warn (never block) when the skill isn't registered with any harness —
+  // the common case after a bare `npm install -g codex-task`. Goes to stderr
+  // for humans and into the warnings array for the parent agent. The run
+  // itself works fine without the skill; this is discoverability only.
+  if (!args.noInstallCheck && !process.env.CODEX_TASK_SKIP_INSTALL_CHECK) {
+    // The probe must never abort the run: os.homedir() can throw (e.g. on
+    // Windows with HOME/USERPROFILE unset), and a check failure is strictly
+    // less important than the task itself.
+    try {
+      if (!skillProbePaths().some((p) => existsSync(p))) {
+        const msg = 'codex-task skill is not registered with any known coding-agent harness; '
+          + 'run "codex-task --install" (or "node codex-task.mjs --install") to register it, '
+          + 'or pass --no-install-check to silence this warning';
+        warnings.push(msg);
+        process.stderr.write(`warning: ${msg}\n`);
+      }
+    } catch (e) {
+      warnings.push(`skill registration check skipped: ${e.message}`);
+    }
+  }
 
   // Resolve workdir. Default: caller's cwd. --cwd accepts relative or absolute.
   const callerCwd = process.cwd();

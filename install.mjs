@@ -33,6 +33,10 @@
  *   node install.mjs --list-targets                           # show targets + detection state, exit
  *   node install.mjs --uninstall                              # remove tool + every target's skill dir
  *
+ * The runtime bin also forwards installer flags, so `codex-task --install`
+ * (plus --uninstall / --list-targets and the target-selection flags) works
+ * from an npm global install without invoking install.mjs directly.
+ *
  * Auto-detection rules:
  *   - claude:   default-on (installed even if ~/.claude/ doesn't exist yet —
  *               most users running this installer have Claude Code installed
@@ -50,7 +54,7 @@
 import { execSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -206,7 +210,11 @@ Usage:
   node install.mjs --uninstall                              remove tool + every skill dir
 
 Known targets: ${[...KNOWN_IDS].join(', ')}
-Explicit-only: ${TARGETS.filter((t) => t.explicitOnly).map((t) => t.id).join(', ') || '(none)'}  (never auto-installed; pass via --target= or --all)`);
+Explicit-only: ${TARGETS.filter((t) => t.explicitOnly).map((t) => t.id).join(', ') || '(none)'}  (never auto-installed; pass via --target= or --all)
+
+The runtime bin forwards installer flags: \`codex-task --install\` (or
+\`node codex-task.mjs --install\`) runs this installer with the same
+target-selection flags; --uninstall and --list-targets forward too.`);
 }
 
 function detect(target) {
@@ -324,12 +332,15 @@ function install(parsed) {
   // ---- Phase 3: copy the runtime tool to the shared install dir ----
   log(`\n[3/4] Copy runtime tool to ${INSTALL_DIR}`);
   mkdirSync(INSTALL_DIR, { recursive: true });
-  copyFileSync(toolSrc, join(INSTALL_DIR, 'codex-task.mjs'));
-  log(`  [ok] codex-task.mjs`);
+  copyIntoInstallDir(toolSrc, 'codex-task.mjs');
+  // Also copy the installer + skill template so installer-mode flags
+  // (`node ~/.codex-task/codex-task.mjs --install|--uninstall|--list-targets`)
+  // keep working from the installed copy, not just a repo checkout.
+  copyIntoInstallDir(join(SCRIPT_DIR, 'install.mjs'), 'install.mjs');
+  copyIntoInstallDir(skillTemplatePath, 'SKILL.md');
   const readmeSrc = join(SCRIPT_DIR, 'README.md');
   if (existsSync(readmeSrc)) {
-    copyFileSync(readmeSrc, join(INSTALL_DIR, 'README.md'));
-    log(`  [ok] README.md`);
+    copyIntoInstallDir(readmeSrc, 'README.md');
   } else {
     log(`  [skip] README.md not in source dir`);
   }
@@ -389,6 +400,25 @@ function install(parsed) {
   log(`  node ${scriptPath} --prompt "Summarize the README.md in this project"\n`);
   log(`Note: per-run scratch files live under your OS temp directory, not in`);
   log(`the project being inspected or edited.`);
+}
+
+/**
+ * Copy a source file into INSTALL_DIR, skipping the copy when the source IS
+ * the installed file (re-running the installer from ~/.codex-task/ itself —
+ * possible now that install.mjs is copied there). Windows paths compare
+ * case-insensitively.
+ */
+function copyIntoInstallDir(src, name) {
+  const dest = join(INSTALL_DIR, name);
+  const same = process.platform === 'win32'
+    ? resolve(src).toLowerCase() === dest.toLowerCase()
+    : resolve(src) === dest;
+  if (same) {
+    log(`  [ok] ${name} (already in place)`);
+    return;
+  }
+  copyFileSync(src, dest);
+  log(`  [ok] ${name}`);
 }
 
 /**
