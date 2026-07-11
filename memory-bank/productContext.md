@@ -10,6 +10,7 @@ Wrap `codex exec` so a parent agent can hand a free-form prompt to codex, let co
 - A longer **details** field (markdown explaining reasoning, caveats, follow-ups).
 - A per-file **files** map (`<path>` → `created|deleted|edited` by default; `referenced` included only with `--track-references`) so the parent agent can audit changes without reading codex's full transcript.
 - A **reasoningEffort** echo (`null` when unset) so callers can see whether `--reasoning-effort` was passed.
+- An **attempts** count only when `--retries > 0`, so callers can see how many `codex exec` invocations occurred.
 
 Billing flows through the ChatGPT subscription as long as `OPENAI_API_KEY` is unset in the spawned env.
 
@@ -28,13 +29,14 @@ Billing flows through the ChatGPT subscription as long as `OPENAI_API_KEY` is un
 - `--track-references` — include `referenced` entries in the `files` map. Default omits referenced-only files to keep parent-agent context small.
 - `--quiet` — compatibility flag; suppresses live streaming even with `--stream-thinking`.
 - `--no-install-check` — skip the startup skill-registration check (also skippable via `CODEX_TASK_SKIP_INSTALL_CHECK=1`).
+- `--retries` — non-negative retry count for non-zero `codex exec` transient infrastructure failures. Classification scans the last diagnostic lines, excludes durable auth/model/effort/quota failures first, and never retries JSON/contract failures or any clean exit-0 result.
 - Installer mode: `--install` / `--uninstall` / `--list-targets` (plus `--target=` / `--all` / `--no-<id>`) forward the invocation to the sibling `install.mjs` and exit with its status; no task runs.
 
 ### Behavior
 - Before any task work, when the codex-task skill is not registered with any known harness (probe: `SKILL.md` under each `TARGETS` skill dir), the run proceeds but a one-line warning goes to stderr and into the result `warnings` array pointing at `codex-task --install`. Escape hatches: `--no-install-check`, `CODEX_TASK_SKIP_INSTALL_CHECK=1`.
 - The tool builds a wrapper prompt: a fixed preamble explaining that the agent's FINAL message must be a single JSON object of a specific shape (with a `read-only`-aware addendum when applicable), followed by the user's task.
 - Preflights `codex --version`; missing/not-runnable Codex returns structured JSON before attempting a run. Then spawns `codex exec` with `--skip-git-repo-check`, `--ephemeral`, `--sandbox <mapped from --permissions>`, `--cd <workdir>`, `--model <model>`, `--output-last-message <sessionDir>/last-message.txt`, optional `-c model_reasoning_effort="<level>"`, plus `--profile <name>` conditionally. `OPENAI_API_KEY` is deleted from the spawned env. Prompt is piped via stdin.
-- Codex's stdout/stderr is captured to bounded tails and is NOT streamed by default. `--stream-thinking` mirrors it live to wrapper stderr. Our stdout is reserved for the final JSON result. Non-zero exits surface the diagnostic tail with hints for auth, quota, model support, reasoning effort rejection, and sandbox failures.
+- Codex's stdout/stderr is captured to bounded tails and is NOT streamed by default. `--stream-thinking` mirrors it live to wrapper stderr. Our stdout is reserved for the final JSON result. Non-zero exits surface the diagnostic tail with hints for auth, quota, model support, reasoning effort rejection, and sandbox failures. With `--retries > 0`, only transient model-capacity / 429 / rate-limit / temporarily-unavailable / overloaded or sandbox-wrapper prep failures are retried; each attempt removes any stale final-message file first.
 - After codex exits cleanly, the tool reads `<sessionDir>/last-message.txt` (codex's CLI process writes this — bypasses the model sandbox), tries strict `JSON.parse`, falls back to fence stripping and balanced-brace extraction if the model added prose around the JSON, validates the shape, normalizes sloppy fields, filters referenced files unless `--track-references`, and emits the final JSON. `ok` is true only when `taskResult` is `completed`.
 - On success without `--debug`, removes the scratch dir. On failure or `--debug`, preserves it; failures surface `sessionDir` in the JSON so the caller can inspect codex's interim output.
 
@@ -56,7 +58,7 @@ Billing flows through the ChatGPT subscription as long as `OPENAI_API_KEY` is un
 }
 ```
 
-On failure: `ok: false`, an `error` field with a stderr tail or parse-failure message, and (usually) `sessionDir` non-null so the caller can dig in.
+On failure: `ok: false`, an `error` field with a stderr tail or parse-failure message, and (usually) `sessionDir` non-null so the caller can dig in. When `--retries > 0`, the JSON also includes `attempts`; otherwise that field is omitted.
 
 ## UX expectations
 - The wrapper takes whatever the underlying codex run takes, typically 15s for trivial codebase questions, 1-5 minutes for multi-file refactors, longer for exploratory investigation. There is no progress signal by default; pass `--stream-thinking` for live Codex chatter on stderr.
@@ -65,4 +67,4 @@ On failure: `ok: false`, an `error` field with a stderr tail or parse-failure me
 - The skill should be leaned on proactively for technical/creative writing, documentation drafts, feature summaries, changelog/release-note prose, README improvements, and narrative cleanup. Coding and code execution are valid but secondary: delegate them when specifically requested or when the task brief clearly asks Codex to implement.
 - Codex runs non-interactively; `codex exec` defaults approval to `never`, so there are no clarifying questions or per-command prompts. The parent agent must specify the task fully up-front.
 - The `read-only` default permission means the wrapper is safe to invoke for investigations without worry about codex modifying the workspace. Refactors and edits require opting in via `--permissions workspace-write`. Cross-tree writes require `--permissions danger-full-access`. The wrapper documents this trade-off heavily in the prompt under `read-only` so codex describes intended edits in `details` rather than failing when its writes are blocked.
-- Failures (`ok: false`) preserve the scratch dir regardless of `--debug`; users can inspect codex's interim output without re-running.
+- Failures (`ok: false`) preserve the scratch dir regardless of `--debug`; users can inspect codex's interim output without re-running. Windows sandbox blocked runs that exit 0 with `taskResult:"blocked"` are a known `--retries` limitation: they are not auto-retried and require manual re-dispatch after changing the brief or sandbox.
