@@ -141,6 +141,83 @@ function skillProbePaths() {
   ];
 }
 
+// ---------- retry classification (Trigger A: non-zero-exit only) ----------
+
+// Short fixed backoff between retried attempts. Overridable via env so tests
+// never sleep for real.
+const RETRY_BACKOFF_MS = process.env.CODEX_TASK_RETRY_DELAY_MS !== undefined
+  ? Number(process.env.CODEX_TASK_RETRY_DELAY_MS)
+  : 2000;
+
+// codex terminal errors are 1-2 lines; 3 is headroom.
+const MAX_TAIL_SCAN = 3;
+
+// Durable failures — retry cannot help. Tested first on each scanned line.
+const NON_TRANSIENT_PATTERNS = [
+  // auth / login expiry
+  /missing bearer|unauthoriz(?:ed|ation)|authentication|\b401\b|codex login|not logged in|invalid api key/i,
+  // unsupported model
+  /model .*not supported|not supported.*ChatGPT account|unsupported model|\b400\b/i,
+  // unsupported / rejected reasoning effort — anchored to explicit REJECTION
+  // grammar so a banner echo like "reasoning effort: high" can never match.
+  /(?:reasoning[ _]?effort|model_reasoning_effort)[^.\n]{0,40}(?:not supported|unsupported|invalid|not a valid)|(?:unsupported|invalid)(?: value(?: for)?)?[^.\n]{0,40}(?:reasoning[ _]?effort|model_reasoning_effort)/i,
+  // durable quota / usage-cap exhaustion — CONTEXTUAL phrases only. Deliberately
+  // NO bare "limit exceeded" and NO bare "rate limit" here, so transient
+  // "429 rate limit exceeded" is NOT swallowed by this phase.
+  /usage limit|weekly limit|monthly limit|usage cap|plan limit|\bquota\b|(?:hit|reached|exceeded) your[^.\n]*\blimit\b/i,
+];
+
+// Isolated sandbox-wrapper PREP failures — retry can help. Used by the Trigger A
+// transient classifier. Intentionally NARROW: wrapper-prep phrases only, NOT the
+// broad sandbox branch in codexFailureHint. A generic permission / read-only
+// denial is a config problem, not transient, so it is NOT retried.
+const SANDBOX_WRAPPER_PATTERNS = [
+  /failed to prepare\b[^\n]*sandbox wrapper/i,
+  /cannot enforce split writable root sets/i,
+  /refusing to run unsandboxed/i,
+  /restricted-token sandbox/i,
+];
+
+// Transient infrastructure for Trigger A — retry can help. First label wins.
+const TRANSIENT_PATTERNS = [
+  { label: 'model-capacity',
+    // Bare "please try again" / "try again later" REMOVED: a real capacity /
+    // rate / temporary signal must be present on the line itself.
+    re: /\bat capacity\b|\b429\b|rate[ _-]?limit|too many requests|temporarily unavailable|server (?:is )?overloaded/i },
+  { label: 'sandbox-wrapper',
+    re: new RegExp(SANDBOX_WRAPPER_PATTERNS.map((r) => r.source).join('|'), 'i') },
+];
+
+// Scan the last few non-blank lines from the END. The first line (closest to
+// the end) that matches a durable OR transient pattern decides the whole tail.
+// A line matching neither is skipped. Durable wins over transient WITHIN a line.
+// No banner grammar: we never try to recognize or strip banner/config text.
+function classifyFailure(tail) {
+  const lines = tail.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const window = lines.slice(-MAX_TAIL_SCAN); // last N non-blank lines
+  for (let i = window.length - 1; i >= 0; i--) { // scan from the END backward
+    const line = window[i];
+    if (NON_TRANSIENT_PATTERNS.some((re) => re.test(line))) {
+      return { label: null, line }; // durable classified line wins -> no retry
+    }
+    for (const { label, re } of TRANSIENT_PATTERNS) {
+      if (re.test(line)) return { label, line }; // transient classified line wins
+    }
+    // line matched nothing -> keep scanning the earlier line
+  }
+  return { label: null, line: window[window.length - 1] ?? '' };
+}
+
+// Same tail derivation formatCodexRunFailure uses — the classification input.
+// error still reports the full raw tail via formatCodexRunFailure.
+function tailOf(runResult) {
+  return (runResult.stderrTail || runResult.stdoutTail || '').trim();
+}
+
+function sleep(ms) {
+  return new Promise((resolveP) => setTimeout(resolveP, ms));
+}
+
 // ---------- arg parsing ----------
 
 function parseArgs(argv) {
@@ -157,6 +234,7 @@ function parseArgs(argv) {
   let profile = '';
   let reasoningEffort = null; // null = flag absent; string = resolved level
   let noInstallCheck = false;
+  let retries = 0;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -177,6 +255,12 @@ function parseArgs(argv) {
       if (next === undefined || next === '') usageErr('--reasoning-effort requires a value');
       reasoningEffort = next; i++;
     }
+    else if (arg === '--retries') {
+      if (next === undefined || !/^-?\d+$/.test(next) || Number(next) < 0) {
+        usageErr('--retries must be a non-negative integer');
+      }
+      retries = Number(next); i++;
+    }
     else if (arg === '-h' || arg === '--help') { printUsage(process.stdout); process.exit(0); }
     else { usageErr(`unknown argument "${arg}"`); }
   }
@@ -191,7 +275,7 @@ function parseArgs(argv) {
     usageErr(`--permissions must be one of: ${allowed} (got "${permissions}")`);
   }
 
-  return { prompt, cwd, out, debug, quiet, streamThinking, trackReferences, model, permissions, profile, reasoningEffort, noInstallCheck };
+  return { prompt, cwd, out, debug, quiet, streamThinking, trackReferences, model, permissions, profile, reasoningEffort, noInstallCheck, retries };
 }
 
 function usageErr(msg) {
@@ -222,7 +306,7 @@ function printUsage(stream = process.stderr) {
   node codex-task.mjs (--prompt "<text>" | --prompt-file <path>)
                       [--cwd DIR] [--out FILE] [--debug] [--quiet]
                       [--stream-thinking] [--track-references]
-                      [--no-install-check]
+                      [--no-install-check] [--retries N]
                       [--model MODEL] [--reasoning-effort LEVEL]
                       [--permissions ${perms}]
                       [--profile NAME]
@@ -301,6 +385,20 @@ Wrapper options:
                  result's "warnings" array) when the codex-task skill is not
                  registered with any known coding-agent harness. Also
                  skippable via CODEX_TASK_SKIP_INSTALL_CHECK=1.
+  --retries      Number of retries (non-negative integer) on a codex exec
+                 failure whose diagnostic tail classifies as a transient
+                 infrastructure error: model-capacity (e.g. "at capacity",
+                 429/rate-limit/temporarily-unavailable/overloaded) or a
+                 sandbox-wrapper prep failure. Default 0 (no retry; omitting
+                 the flag is byte-identical to today). NOT retried: auth,
+                 unsupported model/effort, durable quota/usage-cap limits,
+                 generic "please try again" text, JSON/contract failures, and
+                 every clean (exit-0) result regardless of taskResult
+                 (including "blocked"). Retries are sequential, with a short
+                 fixed backoff (overridable via CODEX_TASK_RETRY_DELAY_MS for
+                 tests). When set > 0, the result JSON gains an "attempts"
+                 field (count of codex exec invocations) and one warning per
+                 retried failure.
 
 Output: JSON on stdout. Shape:
 
@@ -675,6 +773,8 @@ function emit(r, code, outPath) {
 async function main() {
   maybeRunInstaller(process.argv.slice(2));
   const args = parseArgs(process.argv.slice(2));
+  let attempt = 0; // number of `codex exec` invocations so far; incremented at each retry-loop top
+  const retriesEnabled = args.retries > 0;
   const start = Date.now();
   const warnings = [];
 
@@ -712,6 +812,7 @@ async function main() {
       summary: '', details: '', files: {},
       workdir, sessionDir: null,
       model: args.model, permissions: args.permissions, reasoningEffort: args.reasoningEffort,
+      ...(retriesEnabled ? { attempts: attempt } : {}),
       warnings, durationMs: Date.now() - start,
     }, 2, args.out);
   }
@@ -728,6 +829,7 @@ async function main() {
       summary: '', details: '', files: {},
       workdir, sessionDir: null,
       model: args.model, permissions: args.permissions, reasoningEffort: args.reasoningEffort,
+      ...(retriesEnabled ? { attempts: attempt } : {}),
       warnings, durationMs: Date.now() - start,
     }, 1, args.out);
   }
@@ -749,6 +851,7 @@ async function main() {
       summary: '', details: '', files: {},
       workdir, sessionDir,
       model: args.model, permissions: args.permissions, reasoningEffort: args.reasoningEffort,
+      ...(retriesEnabled ? { attempts: attempt } : {}),
       warnings, durationMs: Date.now() - start,
     }, 1, args.out);
   }
@@ -766,24 +869,45 @@ async function main() {
     reasoningEffort: args.reasoningEffort,
   });
 
+  // Retry loop (Trigger A only): sequential, in-process. `attempts <= retries`
+  // gates a retry; a clean (code 0) exit always `break`s immediately — no
+  // clean-exit taskResult (including "blocked") is ever retried. The
+  // pre-attempt rmSync is mandatory even on attempt 1 (force:true no-ops the
+  // first time) so a prior failed attempt never leaves a stale final message
+  // for the next attempt's readResult to see.
   let runResult;
-  try {
-    runResult = await runCodex({
-      prompt,
-      env,
-      args: spawnArgs,
-      streamThinking: args.streamThinking && !args.quiet,
-    });
-  } catch (e) {
-    return emit({
-      ok: false,
-      error: `failed to spawn codex: ${e.message}`,
-      taskResult: 'failed',
-      summary: '', details: '', files: {},
-      workdir, sessionDir,
-      model: args.model, permissions: args.permissions, reasoningEffort: args.reasoningEffort,
-      warnings, durationMs: Date.now() - start,
-    }, 1, args.out);
+  for (;;) {
+    attempt++;
+    rmSync(lastMessagePath, { force: true });
+    try {
+      runResult = await runCodex({
+        prompt,
+        env,
+        args: spawnArgs,
+        streamThinking: args.streamThinking && !args.quiet,
+      });
+    } catch (e) {
+      return emit({
+        ok: false,
+        error: `failed to spawn codex: ${e.message}`,
+        taskResult: 'failed',
+        summary: '', details: '', files: {},
+        workdir, sessionDir,
+        model: args.model, permissions: args.permissions, reasoningEffort: args.reasoningEffort,
+        ...(retriesEnabled ? { attempts: attempt } : {}),
+        warnings, durationMs: Date.now() - start,
+      }, 1, args.out);
+    }
+
+    if (runResult.code === 0) break; // clean exit: never retried, proceed below
+
+    const { label: cls, line: diagLine } = classifyFailure(tailOf(runResult));
+    if (cls && attempt <= args.retries) {
+      warnings.push(`codex attempt ${attempt}/${args.retries + 1} failed (${cls}): ${diagLine}; retrying`);
+      if (RETRY_BACKOFF_MS > 0) await sleep(RETRY_BACKOFF_MS);
+      continue;
+    }
+    break; // non-transient, or transient but retries exhausted
   }
 
   if (runResult.code !== 0) {
@@ -794,6 +918,7 @@ async function main() {
       summary: '', details: '', files: {},
       workdir, sessionDir,
       model: args.model, permissions: args.permissions, reasoningEffort: args.reasoningEffort,
+      ...(retriesEnabled ? { attempts: attempt } : {}),
       warnings, durationMs: Date.now() - start,
     }, 1, args.out);
   }
@@ -808,6 +933,7 @@ async function main() {
       summary: '', details: '', files: {},
       workdir, sessionDir,
       model: args.model, permissions: args.permissions, reasoningEffort: args.reasoningEffort,
+      ...(retriesEnabled ? { attempts: attempt } : {}),
       warnings, durationMs: Date.now() - start,
     }, 1, args.out);
   }
@@ -838,6 +964,7 @@ async function main() {
     model: args.model,
     permissions: args.permissions,
     reasoningEffort: args.reasoningEffort,
+    ...(retriesEnabled ? { attempts: attempt } : {}),
     warnings,
     durationMs: Date.now() - start,
   }, ok ? 0 : 1, args.out);
