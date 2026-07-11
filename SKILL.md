@@ -38,7 +38,7 @@ Codex can access the web when the prompt explicitly asks it to search. No wrappe
 ```bash
 node <<SCRIPT_PATH>> ( --prompt "<task>" | --prompt-file <path> ) \
   [--cwd DIR] [--out FILE] [--debug] [--quiet] \
-  [--stream-thinking] [--track-references] \
+  [--stream-thinking] [--track-references] [--retries N] \
   [--model MODEL] [--reasoning-effort LEVEL] \
   [--permissions read-only|workspace-write|danger-full-access] \
   [--profile NAME]
@@ -79,6 +79,7 @@ node <<SCRIPT_PATH>> ( --prompt "<task>" | --prompt-file <path> ) \
 - `--stream-thinking` (optional flag). Mirror Codex live stdout/stderr to wrapper stderr. Default is silent capture only. Avoid this when invoking from a parent agent unless the human explicitly wants the transcript.
 - `--track-references` (optional flag). Include `referenced` entries in `files`. Default omits referenced-only files to keep the result small.
 - `--quiet` (optional flag). Compatibility flag; live thinking is already off by default, and `--quiet` suppresses streaming even when combined with `--stream-thinking`.
+- `--retries` (optional, default `0`). Retry an invocation, sequentially and in-process, up to N times when it observes a **non-zero codex exit** whose diagnostic tail classifies as a recognized transient-infrastructure failure: model-capacity (`"at capacity"`, `429`/rate-limit/temporarily-unavailable/overloaded) or a sandbox-wrapper prep failure. Default `0` preserves today's behavior byte-for-byte (omitting the flag and passing `--retries 0` are identical). Explicitly NOT retried: auth, unsupported model/effort, durable quota/usage-cap limits, generic "please try again" text with no accompanying transient signal, JSON/contract failures (missing or malformed final message), and **every clean (exit-0) result** regardless of `taskResult` — including `blocked` — because a clean exit means codex was reachable and produced a structured result, so its outcome is task-level, not a transient-infrastructure signal. Retries use a short fixed backoff (overridable via `CODEX_TASK_RETRY_DELAY_MS`, mainly for tests) and are strictly serial — never parallel.
 
 ### Output
 
@@ -113,6 +114,17 @@ When `--reasoning-effort high` is passed, `reasoningEffort` echoes the resolved 
   "reasoningEffort": "high",
 ```
 
+When `--retries N` (N > 0) is passed, the result gains an `attempts` field (count of `codex exec` invocations) and one `warnings` entry per retried failure:
+
+```json
+  "attempts": 2,
+  "warnings": [
+    "codex attempt 1/3 failed (model-capacity): Selected model is at capacity; retrying"
+  ],
+```
+
+`attempts` is omitted entirely when `--retries` is omitted or `0` — the result is otherwise unchanged from today.
+
 #### Field semantics
 
 - `ok` — true iff codex exited cleanly, its final message parsed, and `taskResult` is `completed`. On false, inspect `taskResult`, `error`, `details`, and `warnings`.
@@ -133,7 +145,8 @@ When `--reasoning-effort high` is passed, `reasoningEffort` echoes the resolved 
 - `sessionDir` — `null` after the default cleanup; the absolute scratch dir path otherwise (on failure or `--debug`). Lives under OS temp, not under the workdir.
 - `model` / `permissions` — the resolved values for this run. Useful so callers don't have to re-derive what was passed.
 - `reasoningEffort` — the resolved `--reasoning-effort` level for this run, or `null` if the flag was omitted.
-- `warnings` — non-fatal anomalies (unknown action verbs, missing schema fields, cleanup failures). Worth re-reading before acting.
+- `attempts` — present only when `--retries > 0`. Number of `codex exec` invocations for this run: `0` if it failed before the first invocation (bad `--cwd`, codex preflight failure, session-dir creation failure), `1` if it ran once with no retry, `2`+ if one or more retries fired.
+- `warnings` — non-fatal anomalies (unknown action verbs, missing schema fields, cleanup failures, retried failures). Worth re-reading before acting. Each retried failure adds one entry quoting the matched diagnostic line, the transient class, and the attempt index.
 - `durationMs` — wall-clock duration of the codex run plus this wrapper's overhead.
 
 ## After invoking
@@ -141,7 +154,7 @@ When `--reasoning-effort high` is passed, `reasoningEffort` echoes the resolved 
 1. Check `ok` and `taskResult` first. Treat `blocked`, `failed`, and `partial` as needing review before acting.
 2. Read `summary` for the headline; read `details` for the context.
 3. Walk `files` to see what changed. For each `edited`/`created` entry, consider whether to read the file yourself before acting on it — codex's `details` is informal, not a contract.
-4. If `ok: false`, inspect `taskResult`, `error`, and `sessionDir` where present. Re-run only if it looks like a transient codex hiccup.
+4. If `ok: false`, inspect `taskResult`, `error`, and `sessionDir` where present. `--retries N` already automates re-dispatch for the non-zero-exit capacity/sandbox-wrapper transient hiccups this covers — prefer setting it up front over a manual re-run for those shapes. For everything else (auth, unsupported model/effort, quota, contract failures, and any clean-exit `blocked`/`failed`/`partial`), a manual re-run won't help until the underlying cause is fixed; see Failure modes below.
 5. The wrapper does not pollute the user's project with a scratch dir — `sessionDir` lives under OS temp. Nothing to add to `.gitignore`.
 
 ## Cost & timing awareness
@@ -168,3 +181,9 @@ When `--reasoning-effort high` is passed, `reasoningEffort` echoes the resolved 
 - `warnings` non-empty + `ok: true` — completed with normalization or cleanup notes. Read the warnings, possibly re-run if the data you need is missing.
 - `error: model "X" is not supported when using Codex with a ChatGPT account` — pass a model your plan supports (e.g. omit `--model` to use the default `gpt-5.5`).
 - Diagnostic tail mentioning `model_reasoning_effort` / "reasoning effort" — the chosen `--reasoning-effort` level isn't supported for this model/plan; drop `--reasoning-effort` or pick a supported level (e.g. `low`, `medium`, `high`).
+
+### Known limitation: Windows sandbox blocked-runs are not auto-retried
+
+When codex hits the restricted-token Windows sandbox-wrapper prep failure mid-turn (during an `apply_patch`), it typically recovers, exits **0**, and reports `taskResult: "blocked"` with a `details`/`error` citing the sandbox-wrapper prep failure. Because `--retries` only retries **non-zero** exits (see above), this clean-exit blocked case is **not** covered by `--retries` and remains a **manual re-dispatch**: re-invoke `codex-task` yourself when you see a `blocked` result whose details cite a sandbox-wrapper prep failure.
+
+Rationale: a reliable automatic retry here would need to distinguish a genuine external-blocker `blocked` result from an isolated environment-level tool failure. Text-pattern matching sandbox phrases in the untyped diagnostic tail of a clean exit is not reliable — a model's prose (e.g. a prompt echo or an explanation of why it couldn't proceed) can coincidentally use the same wording on a durable, non-transient `blocked` run, causing a false retry. Doing this safely needs a **structured tool-failure record from codex's event output**, not the untyped tail this wrapper currently captures. That is a candidate future ticket, out of scope here.
