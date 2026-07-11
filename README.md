@@ -196,6 +196,7 @@ There is no wrapper `--search` flag. If the delegated task needs current web inf
 - `--track-references` (optional flag). Include `referenced` entries in `files`. Default omits referenced-only files.
 - `--quiet` (optional flag). Compatibility flag; live thinking is already off by default, and `--quiet` suppresses streaming even when combined with `--stream-thinking`.
 - `--no-install-check` (optional flag). Skip the startup check that warns when the codex-task skill is not registered with any known harness. The warning goes to stderr and into the result's `warnings` array; it never blocks the run. `CODEX_TASK_SKIP_INSTALL_CHECK=1` in the environment has the same effect.
+- `--retries N` (optional, default `0`). Retry non-zero `codex exec` exits whose final diagnostic lines classify as transient infrastructure: model capacity / 429 / rate-limit / temporarily-unavailable / overloaded errors, or sandbox-wrapper preparation failures. Durable failures are excluded first: auth, unsupported model/effort, durable quota or usage-cap limits, generic "please try again" text, JSON/contract failures, and every clean exit-0 result regardless of `taskResult`.
 
 ### Output JSON shape
 
@@ -245,6 +246,8 @@ If codex returns an unknown action verb (`"modified"`, `"updated"`, etc.), the w
 Inspect `warnings` for non-fatal anomalies: unknown action verbs, missing schema fields, cleanup failures.
 
 `reasoningEffort` is the resolved `--reasoning-effort` level for this run, or `null` if the flag was omitted.
+
+`attempts` is present only when `--retries` is greater than zero. It counts `codex exec` invocations, including the final successful or exhausted attempt. Each retried transient failure also adds a warning.
 
 ## Using it from a coding-agent harness
 
@@ -299,6 +302,8 @@ The installer is idempotent: re-running overwrites the installed copy in `~/.cod
 
 9. **Reasoning effort rejected** — if the diagnostic tail mentions `model_reasoning_effort` or reasoning effort, the chosen `--reasoning-effort` level is not supported for that model/plan. Drop the flag or pick a supported level such as `low`, `medium`, or `high`.
 
+10. **Windows sandbox blocked runs with `--retries`** — blocked runs where codex exits 0 and the final JSON says `taskResult:"blocked"` are not auto-retried. `--retries` only handles non-zero `codex exec` transient failures, so manually re-dispatch after adjusting the brief or sandbox.
+
 ## Cost & timing
 
 - Time scales with task scope. Trivial codebase questions: ~15-30s. Multi-file refactors: 1-5 minutes. Long investigations: 5+ minutes.
@@ -345,6 +350,7 @@ Useful options:
 - **Why thinking is opt-in**: parent agents should spend context on the final contract, not another agent's transcript. By default, Codex chatter is captured only for bounded diagnostic tails. `--stream-thinking` mirrors it to stderr when a human wants to watch.
 - **Why references are opt-in**: for most delegated edits, changed files matter more than every file Codex inspected. By default, `files` omits `referenced` entries. `--track-references` restores the larger audit map.
 - **Why coerce unknown action verbs to `referenced`**: codex occasionally returns synonyms like `"modified"` or `"updated"`. Rejecting the whole run for a synonym would be hostile to callers; the wrapper rewrites and warns instead. Referenced entries are omitted unless `--track-references` is set.
+- **Why retries are narrow**: `--retries` is only for non-zero `codex exec` failures with transient infrastructure diagnostics. The wrapper scans the last diagnostic lines, lets durable exclusions win first, removes any stale final-message file before each attempt, and never retries clean exit-0 results, including `taskResult:"blocked"`.
 
 ## Compatibility notes
 
