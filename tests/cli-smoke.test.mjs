@@ -573,6 +573,19 @@ test('codex-task rejects an invalid --retries value', () => {
   assert.match(nan.stderr, /--retries must be a non-negative integer/);
 });
 
+test('codex-task does not misread --retries\' value token as an installer flag', () => {
+  // --retries is value-taking; the installer-dispatch pre-scan must skip its
+  // value the same way it skips --model's, --cwd's, etc. Before the fix,
+  // "--retries --uninstall" (an invalid --retries value that happens to spell
+  // a real installer flag) was misread as installer mode BEFORE arg
+  // validation ran, forwarding straight to install.mjs --uninstall.
+  const result = runNode(['codex-task.mjs', '--prompt', 'noop', '--retries', '--uninstall']);
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /--retries must be a non-negative integer/);
+  assert.doesNotMatch(result.stdout, /uninstall/i);
+});
+
 function makeFakeCodex() {
   const dir = mkdtempSync(join(tmpdir(), 'codex-task-test-'));
   const statePath = join(dir, 'state.txt');

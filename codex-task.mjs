@@ -91,7 +91,7 @@ const INSTALLER_FLAGS = new Set(['--install', '--uninstall', '--list-targets']);
 // is never misread as installer mode.
 const VALUE_TAKING_FLAGS = new Set([
   '--prompt', '--prompt-file', '--cwd', '--out',
-  '--model', '--permissions', '--profile', '--reasoning-effort',
+  '--model', '--permissions', '--profile', '--reasoning-effort', '--retries',
 ]);
 
 function hasInstallerFlag(argv) {
