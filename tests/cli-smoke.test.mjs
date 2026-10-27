@@ -2,11 +2,13 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { CODEX_EXEC_FLAGS, CODEX_EXEC_FLAGS_VERSION, validateExecArgs } from './fake-codex/exec-flags.mjs';
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const EXEC_FLAGS_URL = pathToFileURL(join(repoRoot, 'tests', 'fake-codex', 'exec-flags.mjs')).href;
 
 // Default test env skips the not-installed skill check so results don't
 // depend on what happens to be registered on the machine running the tests.
@@ -586,6 +588,134 @@ test('codex-task does not misread --retries\' value token as an installer flag',
   assert.doesNotMatch(result.stdout, /uninstall/i);
 });
 
+// ---------- codex exec flag contract ----------
+//
+// Fake-codex half (always runs): the fake rejects flags the real
+// `codex exec --help` doesn't list, and every argv shape codex-task emits
+// passes that allowlist.
+//
+// Real-codex half (runs only when a real `codex` is on PATH; CI has none):
+// every flag codex-task emits must appear in `codex exec --help`, and the real
+// parser must accept the exact argv (checked with a trailing `--help`, which
+// clap only honors after validating the earlier args, so no quota is spent).
+
+function runFakeDirect(fake, args, extraEnv = {}) {
+  return spawnSync(process.execPath, [join(fake.dir, 'fake-codex.mjs'), ...args], {
+    cwd: fake.dir,
+    encoding: 'utf8',
+    env: { ...baseEnv, ...extraEnv },
+  });
+}
+
+test('fake codex rejects a flag codex exec no longer has (exit 2, no side effects)', () => {
+  const fake = makeFakeCodex();
+  const out = join(fake.dir, 'last.txt');
+  const result = runFakeDirect(fake, ['exec', '--full-auto', '--output-last-message', out], {
+    FAKE_CODEX_STATE: fake.statePath,
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /unexpected argument '--full-auto' found/);
+  assert.equal(existsSync(out), false, 'fake must fail before writing the final message');
+  assert.equal(existsSync(fake.statePath), false, 'fake must fail before counting an attempt');
+});
+
+test('fake codex rejects a bad --sandbox value and non-exec subcommands', () => {
+  const fake = makeFakeCodex();
+  const bad = runFakeDirect(fake, ['exec', '--sandbox', 'yolo']);
+  assert.equal(bad.status, 2);
+  assert.match(bad.stderr, /invalid value 'yolo' for '--sandbox'/);
+
+  const sub = runFakeDirect(fake, ['review', '--skip-git-repo-check']);
+  assert.equal(sub.status, 2);
+  assert.match(sub.stderr, /unsupported invocation/);
+});
+
+/** Argv codex-task passes to `codex` for the given wrapper flags (via the fake). */
+function emittedArgv(extraArgs) {
+  const fake = makeFakeCodex();
+  const argvOut = join(fake.dir, 'argv-out.json');
+  const result = runNode(['codex-task.mjs', '--prompt', 'noop', ...extraArgs], {
+    env: { ...baseEnv, PATH: `${fake.dir}${delimiter}${process.env.PATH}`, FAKE_CODEX_ARGV_OUT: argvOut },
+  });
+  assert.equal(result.status, 0, `codex-task failed: ${result.stdout}${result.stderr}`);
+  return JSON.parse(readFileSync(argvOut, 'utf8'));
+}
+
+const FULL_FLAG_ARGS = ['--reasoning-effort', 'high', '--profile', 'codex-task-test', '--model', 'gpt-5.5'];
+
+test('codex-task emits only allowlisted codex exec flags in every permission mode', () => {
+  for (const mode of ['read-only', 'workspace-write', 'danger-full-access']) {
+    const argv = emittedArgv(['--permissions', mode, ...FULL_FLAG_ARGS]);
+    assert.equal(argv[0], 'exec');
+    assert.equal(validateExecArgs(argv.slice(1)), null, `argv rejected: ${JSON.stringify(argv)}`);
+    assert.equal(argv[argv.indexOf('--sandbox') + 1], mode);
+    assert.ok(!argv.includes('--full-auto'), '--full-auto was removed from codex exec');
+  }
+});
+
+// Windows needs a shell for the codex.cmd shim; pass one quoted command
+// string (shell:true plus an args array triggers DEP0190).
+function runRealCodex(args) {
+  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000 };
+  if (process.platform !== 'win32') return spawnSync('codex', args, opts);
+  const cmd = ['codex', ...args.map((a) => (/[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))].join(' ');
+  return spawnSync(cmd, { ...opts, shell: true });
+}
+
+function findRealCodex() {
+  const v = runRealCodex(['--version']);
+  const version = v.status === 0 ? (v.stdout ?? '').trim().match(/^codex-cli (\S+)/)?.[1] : null;
+  if (!version) return null; // not installed
+  const h = runRealCodex(['exec', '--help']);
+  if (h.status !== 0 || !/Usage: codex exec/.test(h.stdout)) return null;
+  return { version, help: h.stdout };
+}
+
+/** Option names and `--sandbox` values listed in `codex exec --help`. */
+function parseExecHelp(help) {
+  const options = help.slice(help.indexOf('\nOptions:'));
+  const flags = new Set();
+  for (const line of options.split(/\r?\n/)) {
+    const m = line.match(/^\s+(?:(-[A-Za-z0-9]),\s+)?(--[A-Za-z0-9][\w-]*)/);
+    if (!m) continue;
+    if (m[1]) flags.add(m[1]);
+    flags.add(m[2]);
+  }
+  const sandboxBlock = options.slice(options.indexOf('--sandbox'));
+  const sandboxModes = (sandboxBlock.match(/\[possible values: ([^\]]+)\]/)?.[1] ?? '')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  return { flags, sandboxModes };
+}
+
+const realCodex = findRealCodex();
+const SKIP_REAL = realCodex ? false : 'no real codex CLI on PATH';
+
+test('contract: every flag codex-task emits is accepted by the real codex exec', { skip: SKIP_REAL }, () => {
+  const { flags, sandboxModes } = parseExecHelp(realCodex.help);
+  for (const mode of ['read-only', 'workspace-write', 'danger-full-access']) {
+    const argv = emittedArgv(['--permissions', mode, ...FULL_FLAG_ARGS]);
+    for (const flag of argv.slice(1).filter((a) => a.startsWith('-')).map((a) => a.split('=')[0])) {
+      assert.ok(flags.has(flag), `codex ${realCodex.version} exec --help does not list ${flag}`);
+    }
+    assert.ok(sandboxModes.includes(mode),
+      `codex ${realCodex.version} --sandbox values are [${sandboxModes}], codex-task sends ${mode}`);
+
+    // The real parser validates every arg before honoring a trailing --help.
+    const r = runRealCodex([...argv, '--help']);
+    assert.equal(r.status, 0, `codex ${realCodex.version} rejected codex-task's argv: ${r.stderr}`);
+  }
+});
+
+test('contract: fake-codex allowlist matches the real codex exec --help it was taken from', { skip: SKIP_REAL }, (t) => {
+  if (realCodex.version !== CODEX_EXEC_FLAGS_VERSION) {
+    t.skip(`allowlist is from codex ${CODEX_EXEC_FLAGS_VERSION}, installed ${realCodex.version}; re-derive tests/fake-codex/exec-flags.mjs`);
+    return;
+  }
+  const { flags } = parseExecHelp(realCodex.help);
+  assert.deepEqual([...CODEX_EXEC_FLAGS.keys()].sort(), [...flags].sort());
+});
+
 function makeFakeCodex() {
   const dir = mkdtempSync(join(tmpdir(), 'codex-task-test-'));
   const statePath = join(dir, 'state.txt');
@@ -612,7 +742,12 @@ function makeFakeCodex() {
   return { dir, statePath };
 }
 
-// fake-codex.mjs supports env-driven, on-disk modes (state on disk because
+// fake-codex.mjs is strict about argv: anything but `codex --version` or
+// `codex exec <allowlisted flags>` exits 2 before any side effect. The
+// allowlist (tests/fake-codex/exec-flags.mjs) is copied from the real
+// `codex exec --help`, so a flag removed upstream fails these tests.
+//
+// It also supports env-driven, on-disk modes (state on disk because
 // each `codex exec` invocation is a fresh process):
 //   FAKE_CODEX_STATE            path to a counter file; every non-`--version`
 //                                invocation reads, increments, writes it.
@@ -629,6 +764,7 @@ function makeFakeCodex() {
 function fakeCodexJs(resultJson) {
   return [
     "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
+    `import { validateExecArgs } from ${JSON.stringify(EXEC_FLAGS_URL)};`,
     'const args = process.argv.slice(2);',
     "if (args[0] === '--version') {",
     '  if (process.env.FAKE_CODEX_FAIL_VERSION) {',
@@ -637,6 +773,18 @@ function fakeCodexJs(resultJson) {
     '  }',
     "  console.log('codex-test 0.0.0');",
     '  process.exit(0);',
+    '}',
+    '',
+    '// Strict argument parsing, like the real CLI: anything but `exec`, or a',
+    '// flag `codex exec --help` does not list, exits 2 before any side effect.',
+    "if (args[0] !== 'exec') {",
+    "  console.error(`fake codex: unsupported invocation: ${JSON.stringify(args)}`);",
+    '  process.exit(2);',
+    '}',
+    'const argError = validateExecArgs(args.slice(1));',
+    'if (argError) {',
+    "  console.error(`${argError}\n\nUsage: codex exec [OPTIONS] [PROMPT]`);",
+    '  process.exit(2);',
     '}',
     '',
     'let count = 0;',

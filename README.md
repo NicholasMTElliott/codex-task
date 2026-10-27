@@ -46,14 +46,14 @@ When you're running on a Claude (or other paid) subscription and want to delegat
 | `SKILL.md` | Skill template (Anthropic frontmatter — `name` + `description` + `allowed-tools`). The installer fills in the resolved install path and drops the same rendered file into every target's user-global skills dir. |
 | `scripts/permission-matrix.mjs` | Manual Codex sandbox matrix. Not part of `npm test`; run it explicitly when validating permission behavior against a local project. |
 | `memory-bank/` | LLM-optimized project context (projectBrief, productContext, systemPatterns, techContext). |
-| `tests/` | Node test smoke coverage for the CLI help and installer target listing. |
+| `tests/` | `node --test` suite (`npm test`): CLI help and argument errors, installer target listing and dispatch, the skill-registration warning, `--retries`, and the `codex exec` flag contract. Runs against a strict fake codex whose flag allowlist (`tests/fake-codex/exec-flags.mjs`) is copied from the real `codex exec --help`; contract tests also check a real `codex` when one is on PATH. CI runs it on Node 22/24/26 × Ubuntu/macOS/Windows. |
 | `package.json` | Open-source package metadata, scripts, engine, and optional `codex-task` bin entry. |
 | `LICENSE` | MIT license. |
 | `README.md` | This file. |
 
 ## Prerequisites
 
-1. **Node 18+** on `PATH`.
+1. **Node 22+** on `PATH`.
 2. **`codex` CLI** on `PATH`, authed against a ChatGPT plan.
    - Install: see https://github.com/openai/codex for the current canonical install command on your platform.
    - Auth: `codex login` (uses ChatGPT account; opens a browser for OAuth).
@@ -354,9 +354,9 @@ Useful options:
 
 ## Compatibility notes
 
-- Live-tested on Windows 11 + codex CLI against a ChatGPT Team plan. POSIX (macOS, Linux) is exercised by CI patterns inherited from `codex-image-gen` but the live billing path on POSIX is unverified — please open an issue if you hit anything platform-specific.
+- Live-tested on Windows 11 + codex CLI against a ChatGPT Team plan. CI runs the test suite (strict fake codex, no real codex) on Ubuntu, macOS and Windows with Node 22/24/26, but the live billing path on POSIX is unverified — please open an issue if you hit anything platform-specific.
 - `shell: true` is enabled on Windows only (required to spawn the `codex.cmd` shim post-CVE-2024-27980); on POSIX the script uses `shell: false` since `codex` resolves to a real binary.
-- Requires Node 18+ for nullish coalescing (`??`) and `process.removeAllListeners`.
+- Requires Node 22+. Node 18 and 20 are end-of-life and no longer tested.
 
 ## License
 

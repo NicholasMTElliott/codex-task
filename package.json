@@ -24,7 +24,7 @@
     "skills"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "bin": {
     "codex-task": "./codex-task.mjs"

@@ -36,7 +36,7 @@
  * (codex#11435 parallel-session corruption is only a problem under concurrent
  * invocations; this tool is serial-by-design.)
  *
- * No npm dependencies. Requires Node 18+ and `codex` CLI on PATH.
+ * No npm dependencies. Requires Node 22+ and `codex` CLI on PATH.
  */
 
 import { spawn, spawnSync } from 'node:child_process';
