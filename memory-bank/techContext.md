@@ -3,7 +3,7 @@
 ## Stack
 - **Runtime:** Node 22+ (`engines`; 18 and 20 are EOL).
 - **Language:** JavaScript ESM (`.mjs`). No TypeScript, no transpile step.
-- **Std-lib only:** `node:child_process`, `node:fs`, `node:os`, `node:path`, `node:url`. No `package.json` (besides a stub for `"type":"module"` discoverability — see Repo files), no npm deps.
+- **Std-lib only:** `node:child_process`, `node:fs`, `node:os`, `node:path`, `node:url`. No npm deps. `package.json` is full package metadata (`type: module`, `bin`, `files`, `engines`, scripts, repository links; see Repo files) with no `dependencies`.
 - **External binary:** `codex` CLI on PATH, authenticated against a ChatGPT plan via `codex login`.
 - **Companion project:** `codex-image-gen` (same author, same install patterns, same target registry approach).
 
@@ -85,7 +85,7 @@ Installer paths (per-target; the binary is shared):
 - `.gitignore` — standard Node / OS-noise ignores plus `tmp/` for manual harness artifacts. The wrapper itself does not write into the project directory.
 - `.gitattributes` — normalizes text files to LF for GitHub/cross-platform diffs.
 - `LICENSE` — MIT.
-- `package.json` — npm-compatible metadata (`type: module`, `bin`, `repository`, `bugs`, `homepage`, `keywords`, `engines`, scripts). No dependencies.
+- `package.json` — npm-compatible metadata (`type: module`, `bin`, `files`, `repository`, `bugs`, `homepage`, `keywords`, `engines`, scripts). No dependencies.
 - `tests/cli-smoke.test.mjs` — Node test coverage for CLI help/arg errors, installer target listing, runtime→installer flag forwarding, the skill-registration warning, `--retries`, and the codex exec flag contract. `makeFakeCodex()` writes a temp `codex` shim (`codex.cmd` on Windows) + `fake-codex.mjs` and prepends it to PATH; the fake is strict: anything but `--version` or `exec` + flags in `tests/fake-codex/exec-flags.mjs` exits 2 before side effects.
 - `tests/fake-codex/exec-flags.mjs` — `codex exec` flag allowlist + `--sandbox` values + `validateExecArgs`, copied from `codex exec --help` (codex-cli 0.164.0; same list as codex-image-gen). Contract tests (skip without a real `codex` on PATH; CI has none) check emitted argv against the real help and parser (trailing `--help`) and the allowlist against the real help. On a codex upgrade: re-copy the list, bump `CODEX_EXEC_FLAGS_VERSION`.
 - `.github/workflows/test.yml` — CI: `npm run check` + `npm test` on Node 22/24/26 × ubuntu/macos/windows; push to `mainline` + PRs; concurrency cancels superseded PR runs.
